@@ -4,6 +4,8 @@ import numpy as np
 from io import BytesIO
 import plotly.graph_objects as go
 import os
+import hashlib
+from typing import Dict, Any, Tuple, List, Optional
 
 # =========================================================
 # Constants and colours
@@ -24,7 +26,6 @@ CFD_RADIAL_CHORDS       = 30.0
 
 # Sampling resolution for optional “export sampled points”
 SAMPLED_POINTS_PER_CURVE = 201
-
 
 # =========================================================
 # Maths helpers
@@ -99,22 +100,6 @@ def bezier_point_and_tangent(control_points, u):
     return point, tangent
 
 
-def blade_length_and_thickness_from_count(num_blades):
-    """
-    Table mapping (metres for length, metres for thickness):
-      3 → 50 m, 18 mm
-      4 → 40 m, 15 mm
-      5 → 30 m, 10 mm
-    """
-    if num_blades == 3:
-        return 50.0, 0.018
-    elif num_blades == 4:
-        return 40.0, 0.015
-    elif num_blades == 5:
-        return 30.0, 0.010
-    return 50.0, 0.018
-
-
 def transform_tip_from_root(cp_root, scale_x, scale_z, twist_deg_per_m, blade_length, twist_sign=+1.0):
     """
     Tip section from root:
@@ -156,6 +141,80 @@ def transform_tip_from_root(cp_root, scale_x, scale_z, twist_deg_per_m, blade_le
     cp_tip_2d = np.column_stack([x_tip, z_tip])
     cp_tip_3d = np.column_stack([x_tip, y_tip, z_tip])
     return cp_tip_2d, cp_tip_3d
+
+
+# =========================================================
+# Blade variant table logic (dynamic, no hard-coded restriction)
+# =========================================================
+
+def default_variant_table() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "NumBlades": [3, 4, 5],
+            "BladeLength_m": [50.0, 40.0, 30.0],
+            "Thickness_m": [0.018, 0.015, 0.010],
+        }
+    )
+
+def parse_variant_table_from_excel(xls: pd.ExcelFile) -> Optional[pd.DataFrame]:
+    """
+    Try hard to find a blade variant table in the uploaded config.
+    Accepts:
+      - A sheet named 'Table1' or containing 'variant' or 'blade' and 'table'
+      - Or ANY sheet containing columns that look like NumBlades + (Length/Thickness)
+    """
+    candidate_sheets = []
+    for s in xls.sheet_names:
+        name = s.lower()
+        if "table1" == name or ("variant" in name) or ("blade" in name and "table" in name):
+            candidate_sheets.append(s)
+    # also check all sheets if needed
+    candidate_sheets = candidate_sheets + [s for s in xls.sheet_names if s not in candidate_sheets]
+
+    def normalise_cols(df: pd.DataFrame) -> pd.DataFrame:
+        # Try to map common variants
+        col_map = {}
+        for c in df.columns:
+            cl = str(c).strip().lower()
+            if cl in ["numblades", "num_blades", "blades", "nblades", "n_blades"]:
+                col_map[c] = "NumBlades"
+            if cl in ["blade_length", "bladelength", "length", "blade_length_m", "bladelength_m", "length_m"]:
+                col_map[c] = "BladeLength_m"
+            if cl in ["thickness", "blade_thickness", "bladethickness", "thickness_m", "blade_thickness_m"]:
+                col_map[c] = "Thickness_m"
+        df2 = df.rename(columns=col_map).copy()
+        return df2
+
+    for s in candidate_sheets:
+        try:
+            df = pd.read_excel(xls, sheet_name=s)
+        except Exception:
+            continue
+        if df is None or df.empty:
+            continue
+        df2 = normalise_cols(df)
+        if {"NumBlades", "BladeLength_m", "Thickness_m"}.issubset(df2.columns):
+            out = df2[["NumBlades", "BladeLength_m", "Thickness_m"]].dropna()
+            # coerce numeric
+            try:
+                out["NumBlades"] = out["NumBlades"].astype(int)
+                out["BladeLength_m"] = out["BladeLength_m"].astype(float)
+                out["Thickness_m"] = out["Thickness_m"].astype(float)
+            except Exception:
+                continue
+            out = out.drop_duplicates(subset=["NumBlades"]).sort_values("NumBlades")
+            if len(out) >= 1:
+                return out.reset_index(drop=True)
+    return None
+
+def blade_length_and_thickness_from_table(num_blades: int, table: pd.DataFrame) -> Tuple[float, float]:
+    sub = table[table["NumBlades"] == int(num_blades)]
+    if sub.empty:
+        # fallback: first row
+        r0 = table.iloc[0]
+        return float(r0["BladeLength_m"]), float(r0["Thickness_m"])
+    r = sub.iloc[0]
+    return float(r["BladeLength_m"]), float(r["Thickness_m"])
 
 
 # =========================================================
@@ -230,12 +289,13 @@ def load_hub_control_points(excel_file_like):
     """
     Optional HubControlPoints sheet.
 
-    This version supports BOTH:
-      - Columns: X, Z   (preferred — matches your assignment table “Z and X” wording)
-      - Columns: Y, Z   (legacy fallback, if you already had it)
+    Supports BOTH:
+      - Columns: X, Z   (preferred)
+      - Columns: Y, Z   (legacy fallback)
 
-    Returns numpy array shape (N,2) [X,Z] or [Y,Z] depending on which exists.
-    We also return a label describing which was used.
+    Returns:
+      (cp, used_plane_label) where cp is Nx2 and label is "X–Z" or "Y–Z"
+      or (None, None)
     """
     try:
         xls = pd.ExcelFile(excel_file_like)
@@ -254,7 +314,7 @@ def load_hub_control_points(excel_file_like):
         A = df_sorted["X"].to_numpy()
         B = df_sorted["Z"].to_numpy()
     elif {"Y", "Z"}.issubset(df.columns):
-        used = "Y–Z (legacy)"
+        used = "Y–Z"
         df_sorted = sort_curve_points(df) if ("PointIndex" in df.columns or "Point" in df.columns) else df
         A = df_sorted["Y"].to_numpy()
         B = df_sorted["Z"].to_numpy()
@@ -271,6 +331,10 @@ def load_hub_control_points(excel_file_like):
     return cp, used
 
 
+def file_hash_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
 # =========================================================
 # C² continuity for Curve 2 (cubic Bezier)
 # =========================================================
@@ -283,7 +347,6 @@ def compute_curve2_cubic_c2(root_c1_cubic, trailing_edge=(0.0, 0.0)):
       Q2 = 4*P3 - 4*P2 + P1
       Q3 = trailing_edge
     """
-    P0 = root_c1_cubic[0, :]
     P1 = root_c1_cubic[1, :]
     P2 = root_c1_cubic[2, :]
     P3 = root_c1_cubic[3, :]
@@ -628,7 +691,6 @@ def sampled_blade_points_csv(root_c1, root_c2, tip_c1_top_2d, tip_c2_top_2d, tip
     Produce a CSV of sampled points for:
       - Root top/bottom (Y=0)
       - Tip top/bottom (Y=blade_length_m)
-    Useful if you want to import splines/points directly.
     """
     rows = []
 
@@ -648,7 +710,6 @@ def sampled_blade_points_csv(root_c1, root_c2, tip_c1_top_2d, tip_c2_top_2d, tip
     # Root
     add_curve("Root", "Top", "C1", 0.0, root_c1)
     add_curve("Root", "Top", "C2", 0.0, root_c2)
-    # bottom is mirrored in Z
     add_curve("Root", "Bottom", "C1", 0.0, root_c1 * np.array([1.0, -1.0]))
     add_curve("Root", "Bottom", "C2", 0.0, root_c2 * np.array([1.0, -1.0]))
 
@@ -663,108 +724,302 @@ def sampled_blade_points_csv(root_c1, root_c2, tip_c1_top_2d, tip_c2_top_2d, tip
 
 
 # =========================================================
+# Config behaviour: apply uploaded config ONCE per file change
+# =========================================================
+
+def ensure_state_defaults():
+    """
+    Create baseline defaults only once per session.
+    These are used on first run OR before any config upload.
+    """
+    if "defaults_initialised" in st.session_state:
+        return
+
+    st.session_state.defaults_initialised = True
+
+    # Blade defaults
+    st.session_state.blade_options = [3, 4, 5]
+    st.session_state.num_blades = 3
+    st.session_state.scale_x = 0.8
+    st.session_state.scale_z = 0.8
+    st.session_state.twist_total_deg = 15.0
+    st.session_state.twist_sign = +1.0
+
+    st.session_state.c1_p0_x = 1.0
+    st.session_state.c1_p0_z = 0.0
+    st.session_state.c1_p1_x = 1.0
+    st.session_state.c1_p1_z = 0.0600
+    st.session_state.c1_p2_x = 0.8
+    st.session_state.c1_p2_z = 0.0800
+    st.session_state.c1_p3_x = 0.6
+    st.session_state.c1_p3_z = 0.0750
+
+    # Hub defaults (X–Z)
+    st.session_state.hub_p0_x = -0.4
+    st.session_state.hub_p0_z = 1.0
+    st.session_state.hub_p1_x = 0.3
+    st.session_state.hub_p1_z = 1.0
+    st.session_state.hub_p2_x = 13.0
+    st.session_state.hub_p2_z = 0.8
+    st.session_state.hub_p3_x = 2.0
+    st.session_state.hub_p3_z = 0.0
+
+    # Plot visibility
+    st.session_state.show_root = True
+    st.session_state.show_tip = True
+
+    # Abaqus defaults
+    st.session_state.abaqus_load_mag = 1000.0
+    st.session_state.abaqus_u = 0.5
+    st.session_state.abaqus_flip_normal = False
+    st.session_state.abaqus_target = "Tip_C2_Top"  # requested default
+
+    # Config tracking
+    st.session_state.last_config_hash = None
+
+
+def apply_config_once_if_new(uploaded_bytes: bytes) -> Tuple[bool, List[str], pd.DataFrame]:
+    """
+    If a config is uploaded and is new, overwrite session_state defaults + dropdown options.
+    Do NOT keep re-applying on every rerun (prevents reverting user edits).
+    """
+    warnings = []
+    applied = False
+    variant_table = default_variant_table()
+
+    if uploaded_bytes is None:
+        return applied, warnings, variant_table
+
+    cfg_hash = file_hash_bytes(uploaded_bytes)
+    if st.session_state.last_config_hash == cfg_hash:
+        # Same file as last time: do nothing
+        return applied, warnings, variant_table
+
+    # New config file: apply it ONCE, and record hash
+    st.session_state.last_config_hash = cfg_hash
+    applied = True
+
+    try:
+        xls = pd.ExcelFile(BytesIO(uploaded_bytes))
+    except Exception:
+        warnings.append("Config upload could not be read as an Excel file. Using current sidebar values.")
+        return applied, warnings, variant_table
+
+    # Variant table (this is what drives dynamic blade dropdown options)
+    vt = parse_variant_table_from_excel(xls)
+    if vt is not None:
+        variant_table = vt
+        new_opts = list(map(int, variant_table["NumBlades"].tolist()))
+        if len(new_opts) >= 1:
+            st.session_state.blade_options = new_opts
+            # If current selection not in new options, set to first option
+            if int(st.session_state.num_blades) not in new_opts:
+                st.session_state.num_blades = int(new_opts[0])
+    else:
+        warnings.append("No blade variant table found in config; using default blade options (3,4,5).")
+
+    # Parameters sheet (optional overrides)
+    params = load_parameters(BytesIO(uploaded_bytes))
+    if params:
+        # Common parameters: update defaults visible in UI
+        def try_set_float(key_state: str, param_name: str):
+            if param_name in params:
+                try:
+                    st.session_state[key_state] = float(params[param_name])
+                except Exception:
+                    warnings.append(f"Parameter '{param_name}' was not a valid number; ignored.")
+
+        def try_set_int(key_state: str, param_name: str):
+            if param_name in params:
+                try:
+                    st.session_state[key_state] = int(float(params[param_name]))
+                except Exception:
+                    warnings.append(f"Parameter '{param_name}' was not a valid integer; ignored.")
+
+        try_set_int("num_blades", "NumBlades")
+        # Ensure selection valid vs options (if options exist)
+        if "blade_options" in st.session_state and st.session_state.blade_options:
+            if int(st.session_state.num_blades) not in st.session_state.blade_options:
+                st.session_state.num_blades = int(st.session_state.blade_options[0])
+
+        try_set_float("scale_x", "ScaleX")
+        try_set_float("scale_z", "ScaleZ")
+        try_set_float("twist_total_deg", "TwistTotalDeg")
+
+        if "TwistSign" in params:
+            try:
+                st.session_state.twist_sign = +1.0 if float(params["TwistSign"]) >= 0 else -1.0
+            except Exception:
+                warnings.append("Parameter 'TwistSign' invalid; ignored.")
+
+    # Root control points from BezierControlPoints sheet (optional)
+    cp_df = load_bezier_control_points(BytesIO(uploaded_bytes))
+    if cp_df is not None:
+        sub = cp_df[(cp_df.get("Section") == "Root") & (cp_df.get("Curve") == 1)]
+        if not sub.empty and {"X", "Z"}.issubset(sub.columns):
+            sub_sorted = sort_curve_points(sub)
+            X = sub_sorted["X"].to_numpy()
+            Z = sub_sorted["Z"].to_numpy()
+            if not (np.isnan(X).any() or np.isnan(Z).any()) and X.shape[0] >= 4:
+                # Apply first four
+                st.session_state.c1_p0_x = float(X[0]); st.session_state.c1_p0_z = float(Z[0])
+                st.session_state.c1_p1_x = float(X[1]); st.session_state.c1_p1_z = float(Z[1])
+                st.session_state.c1_p2_x = float(X[2]); st.session_state.c1_p2_z = float(Z[2])
+                st.session_state.c1_p3_x = float(X[3]); st.session_state.c1_p3_z = float(Z[3])
+            else:
+                warnings.append("BezierControlPoints Root/Curve1 found but invalid; ignored.")
+
+    # Hub CPs from HubControlPoints (optional) -> apply first 4 if present
+    hub_cp, hub_plane = load_hub_control_points(BytesIO(uploaded_bytes))
+    if hub_cp is not None and hub_cp.shape[0] >= 4:
+        # If config gives Y–Z legacy, we still store into hub_p*_x for CATIA design naming (your request)
+        st.session_state.hub_p0_x = float(hub_cp[0, 0]); st.session_state.hub_p0_z = float(hub_cp[0, 1])
+        st.session_state.hub_p1_x = float(hub_cp[1, 0]); st.session_state.hub_p1_z = float(hub_cp[1, 1])
+        st.session_state.hub_p2_x = float(hub_cp[2, 0]); st.session_state.hub_p2_z = float(hub_cp[2, 1])
+        st.session_state.hub_p3_x = float(hub_cp[3, 0]); st.session_state.hub_p3_z = float(hub_cp[3, 1])
+    elif hub_cp is None:
+        warnings.append("No valid HubControlPoints found in config; using current hub defaults.")
+
+    # Abaqus defaults from Parameters (optional)
+    if params:
+        if "AbaqusLoadMag" in params:
+            try:
+                st.session_state.abaqus_load_mag = float(params["AbaqusLoadMag"])
+            except Exception:
+                warnings.append("AbaqusLoadMag invalid; ignored.")
+        if "AbaqusU" in params:
+            try:
+                st.session_state.abaqus_u = float(params["AbaqusU"])
+            except Exception:
+                warnings.append("AbaqusU invalid; ignored.")
+        if "AbaqusTarget" in params:
+            st.session_state.abaqus_target = str(params["AbaqusTarget"])
+
+    return applied, warnings, variant_table
+
+
+# =========================================================
 # Streamlit app
 # =========================================================
 
 def main():
     st.set_page_config(page_title="CAE4 Blade & Hub Tool", layout="wide")
 
-    # ---------- Sidebar ----------
+    ensure_state_defaults()
+
+    # ---------- Sidebar (upload must happen early so it can update session_state BEFORE widgets) ----------
     with st.sidebar:
-        # 1) Blade geometry inputs
+        with st.expander("Config", expanded=False):
+            st.markdown("**Excel configuration (optional)**")
+            uploaded_file = st.file_uploader(
+                "Upload Excel configuration (optional)",
+                type=["xlsx"],
+                key="excel_upload",
+            )
+        uploaded_bytes = uploaded_file.read() if uploaded_file is not None else None
+
+    # Apply config once per new file (this is what prevents reverting-on-edit)
+    config_applied, config_warnings, variant_table = apply_config_once_if_new(uploaded_bytes)
+
+    # ---------- Sidebar (now build all widgets, using session_state keys) ----------
+    with st.sidebar:
         with st.expander("Blade geometry inputs", expanded=True):
-            st.markdown("**Root Curve 1 – cubic control points (Figure 2)**")
+            st.markdown("**Root Curve 1 – Control Points**")
 
-            c1_p0_x = st.number_input("Curve 1 P0 x", value=1.0, format="%.4f")
-            c1_p0_z = st.number_input("Curve 1 P0 z", value=0.0000, format="%.4f")
+            st.number_input("Curve 1 P0 x", key="c1_p0_x", format="%.4f")
+            st.number_input("Curve 1 P0 z", key="c1_p0_z", format="%.4f")
 
-            c1_p1_x = st.number_input("Curve 1 P1 x", value=1.0, format="%.4f")
-            c1_p1_z = st.number_input("Curve 1 P1 z", value=0.0600, format="%.4f")
+            st.number_input("Curve 1 P1 x", key="c1_p1_x", format="%.4f")
+            st.number_input("Curve 1 P1 z", key="c1_p1_z", format="%.4f")
 
-            c1_p2_x = st.number_input("Curve 1 P2 x", value=0.8, format="%.4f")
-            c1_p2_z = st.number_input("Curve 1 P2 z", value=0.0800, format="%.4f")
+            st.number_input("Curve 1 P2 x", key="c1_p2_x", format="%.4f")
+            st.number_input("Curve 1 P2 z", key="c1_p2_z", format="%.4f")
 
-            c1_p3_x = st.number_input("Curve 1 P3 x", value=0.6, format="%.4f")
-            c1_p3_z = st.number_input("Curve 1 P3 z", value=0.0750, format="%.4f")
+            st.number_input("Curve 1 P3 x", key="c1_p3_x", format="%.4f")
+            st.number_input("Curve 1 P3 z", key="c1_p3_z", format="%.4f")
 
             st.markdown("---")
             st.markdown("**Blade variant (Table 1) + tip transform**")
 
-            num_blades_ui = st.selectbox("Number of blades (3 variants from Table 1)", [3, 4, 5], index=0)
+            # Dynamic options (updated by config)
+            blade_opts = st.session_state.get("blade_options", [3, 4, 5])
+            if not blade_opts:
+                blade_opts = [3, 4, 5]
+                st.session_state.blade_options = blade_opts
 
-            scale_x_ui = st.number_input("Scale factor in X (example 0.8)", min_value=0.1, max_value=3.0, value=0.8, step=0.05)
-            scale_z_ui = st.number_input("Scale factor in Z (example 0.8)", min_value=0.1, max_value=3.0, value=0.8, step=0.05)
+            # Ensure current selection valid
+            if int(st.session_state.num_blades) not in blade_opts:
+                st.session_state.num_blades = int(blade_opts[0])
 
-            twist_total_deg_ui = st.number_input(
+            st.selectbox(
+                "Number of blades (from variant table)",
+                options=blade_opts,
+                key="num_blades",
+            )
+
+            st.number_input("Scale factor in X (example 0.8)", min_value=0.1, max_value=3.0, step=0.05, key="scale_x")
+            st.number_input("Scale factor in Z (example 0.8)", min_value=0.1, max_value=3.0, step=0.05, key="scale_z")
+
+            st.number_input(
                 "Total twist from root to tip (degrees)",
                 min_value=0.0,
                 max_value=90.0,
-                value=15.0,
                 step=0.5,
                 format="%.2f",
+                key="twist_total_deg",
             )
-            twist_direction = st.selectbox("Twist direction", ["Positive", "Negative"], index=0)
-            twist_sign_ui = +1.0 if twist_direction == "Positive" else -1.0
+            twist_direction = st.selectbox(
+                "Twist direction",
+                ["Positive", "Negative"],
+                index=0 if st.session_state.twist_sign >= 0 else 1,
+                key="twist_direction_ui",
+            )
+            st.session_state.twist_sign = +1.0 if twist_direction == "Positive" else -1.0
 
-        # 2) Hub geometry inputs (UPDATED: X–Z by default)
         with st.expander("Hub geometry inputs", expanded=False):
-            st.markdown("**Hub profile – cubic Bezier (X–Z)**")
-            st.markdown(
-                "This matches the assignment hub table style you described (“Z and X”). "
-                "If you upload Excel, the app will prefer `X` and `Z` columns in `HubControlPoints`."
-            )
+            st.markdown("**Hub profile – Control Points (X–Z by default)**")
+            st.number_input("Hub P0 X", key="hub_p0_x", format="%.4f")
+            st.number_input("Hub P0 Z", key="hub_p0_z", format="%.4f")
 
-            hub_p0_x = st.number_input("Hub P0 X", value=-0.4, format="%.4f")
-            hub_p0_z = st.number_input("Hub P0 Z", value=1.0, format="%.4f")
+            st.number_input("Hub P1 X", key="hub_p1_x", format="%.4f")
+            st.number_input("Hub P1 Z", key="hub_p1_z", format="%.4f")
 
-            hub_p1_x = st.number_input("Hub P1 X", value=0.3, format="%.4f")
-            hub_p1_z = st.number_input("Hub P1 Z", value=1.0, format="%.4f")
+            st.number_input("Hub P2 X", key="hub_p2_x", format="%.4f")
+            st.number_input("Hub P2 Z", key="hub_p2_z", format="%.4f")
 
-            hub_p2_x = st.number_input("Hub P2 X", value=13.0, format="%.4f")
-            hub_p2_z = st.number_input("Hub P2 Z", value=0.8, format="%.4f")
+            st.number_input("Hub P3 X", key="hub_p3_x", format="%.4f")
+            st.number_input("Hub P3 Z", key="hub_p3_z", format="%.4f")
 
-            hub_p3_x = st.number_input("Hub P3 X", value=2.0, format="%.4f")
-            hub_p3_z = st.number_input("Hub P3 Z", value=0.0, format="%.4f")
-
-        # 3) Config (Excel upload etc.)
-        with st.expander("Config", expanded=False):
-            st.markdown("**Excel configuration (optional)**")
-            st.markdown(
-                """
-                - If you **do not** upload a file, the tool uses the sidebar inputs.
-                - If you **do** upload a file, it can override:
-                  - Root Curve 1 control points (sheet `BezierControlPoints`, Section='Root', Curve=1),
-                  - Hub control points (sheet `HubControlPoints`, columns `X`,`Z` preferred),
-                  - Parameters (sheet `Parameters` with columns `Name`, `Value`) e.g.:
-                    - `NumBlades`, `ScaleX`, `ScaleZ`, `TwistTotalDeg`.
-                """
-            )
-
-            template_bytes = read_template_bytes()
-            if template_bytes is not None:
-                st.download_button(
-                    label="📥 Download Excel template",
-                    data=template_bytes,
-                    file_name="blade_bezier_assignment_template.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="download_template",
-                )
-            else:
-                st.info("Template file 'blade_bezier_assignment_template.xlsx' not found in the working directory.")
-
-            uploaded_file = st.file_uploader("Upload Excel configuration (optional)", type=["xlsx"], key="excel_upload")
-
-        # 4) Plot visibility toggles
         with st.expander("Plot visibility", expanded=False):
-            show_root = st.checkbox("Show root curves", value=True)
-            show_tip = st.checkbox("Show tip curves", value=True)
+            st.checkbox("Show root curves", key="show_root")
+            st.checkbox("Show tip curves", key="show_tip")
 
-        # 5) Extra exports
-        with st.expander("Exports (extra)", expanded=False):
-            st.markdown("**Optional exports useful for CAD imports**")
-            export_sampled_points = st.checkbox("Enable sampled blade points CSV export", value=True)
+        # Abaqus controls in sidebar (as requested)
+        with st.expander("Abaqus", expanded=False):
+            st.number_input("Load magnitude (N)", min_value=0.0, step=50.0, key="abaqus_load_mag")
+            st.slider("Force location u (0 to 1)", min_value=0.0, max_value=1.0, step=0.01, key="abaqus_u")
 
-    st.title("CAE4 – Blade & Hub Parametric Tool (Assignment-aligned)")
+            # Combined dropdown: Section_Curve_Surface
+            targets = [
+                "Root_C1_Top", "Root_C2_Top", "Tip_C1_Top", "Tip_C2_Top",
+                "Root_C1_Bottom", "Root_C2_Bottom", "Tip_C1_Bottom", "Tip_C2_Bottom",
+            ]
+            # Ensure default exists
+            if st.session_state.abaqus_target not in targets:
+                st.session_state.abaqus_target = "Tip_C2_Top"
+
+            st.selectbox(
+                "Apply load to",
+                options=targets,
+                key="abaqus_target",
+            )
+            st.checkbox("Flip normal direction", key="abaqus_flip_normal")
+
+        # Downloads expander (CATIA + config template + Abaqus script)
+        # We create the files after computing geometry, but place the buttons here later using placeholders.
+        downloads_placeholder = st.empty()
+
+    st.title("CAE4 – Blade & Hub Parametric Tool")
 
     # ---------- Tabs ----------
     tab_overview, tab_blade, tab_3d, tab_hub, tab_cfd, tab_abaqus = st.tabs(
@@ -774,108 +1029,55 @@ def main():
     # ---------- Overview tab ----------
     with tab_overview:
         st.header("Overview")
+        if config_applied:
+            st.success("Config applied (as new defaults). You can now tweak values in the sidebar without them reverting.")
+        if config_warnings:
+            for w in config_warnings:
+                st.info(w)
+
         st.markdown(
             """
-            **Blade (Figure 2)**
-
-            - Root outer profile (top half):
-              - Defined by **two cubic Bezier curves** in the X–Z plane.
-              - **Curve 1**: 4 control points are the design variables.
-              - **Curve 2**: computed automatically to:
-                - start at the end of Curve 1,
-                - end at trailing edge at (0,0),
-                - satisfy **C² continuity** at the join.
-
-            - Tip section:
-              1. Same aerofoil as the root,
-              2. Scaled in X and Z about the leading edge,
-              3. Twisted about the same point,
-              4. Translated along +Y by the blade length (from Table 1).
+            **Blade**
+            - Root profile: 2 cubic Bezier curves in X–Z, Curve 2 computed for C² at join and trailing edge at origin.
+            - Tip: scale + twist + translate along Y.
 
             **Hub**
+            - Hub profile uses control points in X–Z (preferred) or Y–Z (legacy).
+            - Design table exports hub points as X/Z fields (CATIA-side naming).
 
-            - External hub profile is defined by a **Bezier curve**.
-            - This app exports hub values in **X–Z** (updated from the earlier Y–Z version),
-              to match the hub table style you described.
-
-            **CFD domain + Abaqus helpers**
-
-            - CFD domain extents from chord-length multipliers.
-            - Tip Curve 2: u=0.5 point + surface normal direction for the 1 kN load.
+            **Abaqus**
+            - Choose a target curve/surface, pick u location, and export a Python stub.
             """
         )
 
-    # ---------- Excel loading (optional) ----------
-    cp_df = None
-    params_from_excel = {}
-    hub_cp_excel = None
-    hub_plane_excel = None
-    excel_loaded = False
-    excel_warnings = []
+    # =========================================================
+    # Compute geometry from current (editable) session_state
+    # =========================================================
 
-    if uploaded_file is not None:
-        excel_loaded = True
-        excel_bytes = uploaded_file.read()
+    # Variant table drives length/thickness
+    num_blades = int(st.session_state.num_blades)
+    blade_length_m, blade_thickness_m = blade_length_and_thickness_from_table(num_blades, variant_table)
 
-        cp_df = load_bezier_control_points(BytesIO(excel_bytes))
-        if cp_df is None:
-            excel_warnings.append("No or invalid `BezierControlPoints` sheet found; using sidebar CP inputs.")
+    scale_x = float(st.session_state.scale_x)
+    scale_z = float(st.session_state.scale_z)
+    twist_total_deg = float(st.session_state.twist_total_deg)
+    twist_sign = float(st.session_state.twist_sign)
 
-        params_from_excel = load_parameters(BytesIO(excel_bytes))
-        if params_from_excel:
-            excel_warnings.append("Using parameters from Excel `Parameters` sheet (where provided) instead of sidebar values.")
-
-        hub_cp_excel, hub_plane_excel = load_hub_control_points(BytesIO(excel_bytes))
-        if hub_cp_excel is None:
-            excel_warnings.append("No valid `HubControlPoints` sheet found; using sidebar hub CP inputs.")
-
-    # ---------- Resolve parameters and compute geometry ----------
-    num_blades = int(params_from_excel.get("NumBlades", num_blades_ui))
-    if num_blades not in [3, 4, 5]:
-        num_blades = num_blades_ui
-
-    scale_x = float(params_from_excel.get("ScaleX", scale_x_ui))
-    scale_z = float(params_from_excel.get("ScaleZ", scale_z_ui))
-    twist_total_deg = float(params_from_excel.get("TwistTotalDeg", twist_total_deg_ui))
-
-    blade_length_m, blade_thickness_m = blade_length_and_thickness_from_count(num_blades)
     twist_deg_per_m = twist_total_deg / blade_length_m if blade_length_m > 0 else 0.0
-    twist_sign = twist_sign_ui  # from sidebar direction (Excel could be added later if you want)
 
-    # Root Curve 1 CPs: from Excel if present, else sidebar
-    root_c1_cubic = None
-    used_c1_source = "Sidebar inputs"
+    # Root Curve 1 CPs
+    root_c1_cubic = np.array(
+        [
+            [st.session_state.c1_p0_x, st.session_state.c1_p0_z],
+            [st.session_state.c1_p1_x, st.session_state.c1_p1_z],
+            [st.session_state.c1_p2_x, st.session_state.c1_p2_z],
+            [st.session_state.c1_p3_x, st.session_state.c1_p3_z],
+        ],
+        dtype=float,
+    )
 
-    if cp_df is not None:
-        sub = cp_df[(cp_df.get("Section") == "Root") & (cp_df.get("Curve") == 1)]
-        if not sub.empty and {"X", "Z"}.issubset(sub.columns):
-            sub_sorted = sort_curve_points(sub)
-            X = sub_sorted["X"].to_numpy()
-            Z = sub_sorted["Z"].to_numpy()
-            if not (np.isnan(X).any() or np.isnan(Z).any()) and X.shape[0] >= 4:
-                root_c1_all = np.column_stack([X, Z])
-                if root_c1_all.shape[0] > 4:
-                    excel_warnings.append(
-                        "Excel provided >4 Root/Curve1 points. Using first four as cubic P0..P3."
-                    )
-                root_c1_cubic = root_c1_all[:4, :]
-                used_c1_source = "Excel (BezierControlPoints)"
-            else:
-                excel_warnings.append("Excel Root/Curve1 incomplete (<4 points). Falling back to sidebar.")
-
-    if root_c1_cubic is None:
-        root_c1_cubic = np.array(
-            [[c1_p0_x, c1_p0_z],
-             [c1_p1_x, c1_p1_z],
-             [c1_p2_x, c1_p2_z],
-             [c1_p3_x, c1_p3_z]],
-            dtype=float,
-        )
-
-    # Root Curve 2: C² continuity + TE at origin
+    # Root Curve 2 via C² continuity + TE at origin
     root_c2_cubic = compute_curve2_cubic_c2(root_c1_cubic, trailing_edge=(0.0, 0.0))
-
-    # Continuity check (new small functional feature)
     c0_res, c1_res, c2_res = continuity_residuals_cubic(root_c1_cubic, root_c2_cubic)
 
     # Tip transform – top and bottom separately
@@ -888,7 +1090,7 @@ def main():
         twist_deg_per_m=twist_deg_per_m, blade_length=blade_length_m,
         twist_sign=twist_sign,
     )
-    tip_all_bottom_2d, _ = transform_tip_from_root(
+    tip_all_bottom_2d, tip_all_bottom_3d = transform_tip_from_root(
         root_all_cps_bottom, scale_x=scale_x, scale_z=scale_z,
         twist_deg_per_m=twist_deg_per_m, blade_length=blade_length_m,
         twist_sign=twist_sign,
@@ -910,37 +1112,22 @@ def main():
         tip_c1_bottom_2d, tip_c2_bottom_2d,
     )
 
-    # Tip Curve 2 – u=0.5 point and normal
-    u_load = 0.5
-    pt2d, tan2d = bezier_point_and_tangent(tip_c2_top_2d, u_load)
-    x_u, z_u = pt2d
-    dxdu, dzdu = tan2d
-
-    load_point_3d = np.array([x_u, blade_length_m, z_u], dtype=float)
-    tangent_3d = np.array([dxdu, 0.0, dzdu], dtype=float)
-    normal_3d = np.array([-tangent_3d[2], 0.0, tangent_3d[0]], dtype=float)
-    norm_mag = np.linalg.norm(normal_3d)
-    normal_unit_3d = normal_3d / norm_mag if norm_mag > 0 else np.array([0.0, 0.0, 0.0])
-
-    # Hub CPs (UPDATED: X–Z output; Excel supports X–Z preferred)
-    if hub_cp_excel is not None:
-        hub_cp_az = hub_cp_excel
-        hub_plane_label = "X–Z" if hub_plane_excel == "X–Z" else "Y–Z"
-        hub_source_label = f"Excel (HubControlPoints, {hub_plane_label})"
-    else:
-        hub_cp_az = np.array(
-            [[hub_p0_x, hub_p0_z],
-             [hub_p1_x, hub_p1_z],
-             [hub_p2_x, hub_p2_z],
-             [hub_p3_x, hub_p3_z]],
-            dtype=float,
-        )
-        hub_plane_label = "X–Z"
-        hub_source_label = "Sidebar Hub CP inputs (X–Z)"
+    # Hub CPs (sidebar is X–Z)
+    hub_cp_az = np.array(
+        [
+            [st.session_state.hub_p0_x, st.session_state.hub_p0_z],
+            [st.session_state.hub_p1_x, st.session_state.hub_p1_z],
+            [st.session_state.hub_p2_x, st.session_state.hub_p2_z],
+            [st.session_state.hub_p3_x, st.session_state.hub_p3_z],
+        ],
+        dtype=float,
+    )
+    hub_plane_label = "X–Z"
+    hub_source_label = "Sidebar Hub CP inputs (X–Z)"
 
     # Chord length and CFD domain extents (root)
     x_all_root = np.concatenate([root_c1_cubic[:, 0], root_c2_cubic[:, 0]])
-    chord_length = np.max(x_all_root) - 0.0
+    chord_length = float(np.max(x_all_root) - 0.0)
 
     cfd_x_min = -CFD_X_UPSTREAM_CHORDS * chord_length
     cfd_x_max = CFD_X_DOWNSTREAM_CHORDS * chord_length
@@ -949,7 +1136,47 @@ def main():
     cfd_z_min = -CFD_RADIAL_CHORDS * chord_length
     cfd_z_max = +CFD_RADIAL_CHORDS * chord_length
 
-    # Output tables (blade)
+    # Abaqus: build the target curve arrays (2D x-z, plus the span y)
+    curves_2d = {
+        "Root_C1_Top": root_c1_cubic,
+        "Root_C2_Top": root_c2_cubic,
+        "Tip_C1_Top": tip_c1_top_2d,
+        "Tip_C2_Top": tip_c2_top_2d,
+        "Root_C1_Bottom": root_c1_cubic * np.array([1.0, -1.0]),
+        "Root_C2_Bottom": root_c2_cubic * np.array([1.0, -1.0]),
+        "Tip_C1_Bottom": tip_c1_bottom_2d,
+        "Tip_C2_Bottom": tip_c2_bottom_2d,
+    }
+    curve_to_y = {
+        "Root_C1_Top": 0.0, "Root_C2_Top": 0.0, "Root_C1_Bottom": 0.0, "Root_C2_Bottom": 0.0,
+        "Tip_C1_Top": blade_length_m, "Tip_C2_Top": blade_length_m, "Tip_C1_Bottom": blade_length_m, "Tip_C2_Bottom": blade_length_m,
+    }
+
+    abaqus_target = st.session_state.abaqus_target
+    abaqus_u = float(st.session_state.abaqus_u)
+    load_mag = float(st.session_state.abaqus_load_mag)
+
+    target_curve_2d = curves_2d.get(abaqus_target, tip_c2_top_2d)
+    y_for_target = float(curve_to_y.get(abaqus_target, blade_length_m))
+
+    pt2d, tan2d = bezier_point_and_tangent(target_curve_2d, abaqus_u)
+    x_u, z_u = float(pt2d[0]), float(pt2d[1])
+    dxdu, dzdu = float(tan2d[0]), float(tan2d[1])
+
+    load_point_3d = np.array([x_u, y_for_target, z_u], dtype=float)
+
+    tangent_3d = np.array([dxdu, 0.0, dzdu], dtype=float)
+    normal_3d = np.array([-tangent_3d[2], 0.0, tangent_3d[0]], dtype=float)
+    norm_mag = float(np.linalg.norm(normal_3d))
+    normal_unit_3d = normal_3d / norm_mag if norm_mag > 0 else np.array([0.0, 0.0, 0.0])
+
+    if bool(st.session_state.abaqus_flip_normal):
+        normal_unit_3d = -normal_unit_3d
+
+    # =========================================================
+    # Output tables for exports
+    # =========================================================
+
     root_c1_df_out = pd.DataFrame(root_c1_cubic, columns=["X (m)", "Z (m)"])
     root_c1_df_out.insert(0, "Curve", "Root Curve 1")
     root_c1_df_out.insert(1, "Point index", [0, 1, 2, 3])
@@ -968,14 +1195,12 @@ def main():
     tip_c2_df_out.insert(0, "Curve", "Tip Curve 2")
     tip_c2_df_out.insert(1, "Point index", [0, 1, 2, 3])
 
-    # Hub export for design table: X–Z preferred (if input was Y–Z, we still export as the plane label)
-    hub_df_out_for_design = pd.DataFrame(hub_cp_az, columns=[f"{hub_plane_label.split('–')[0]} (m)", "Z (m)"])
+    hub_df_out_for_design = pd.DataFrame(hub_cp_az, columns=["X (m)", "Z (m)"])
     hub_df_out_for_design.insert(0, "Point index", list(range(hub_cp_az.shape[0])))
 
-    # CATIA design table (single configuration) — UPDATED HUB KEYS: Hub_P*_X and Hub_P*_Z
-    # If you happened to load legacy Y–Z from Excel, the values still go out as Hub_P*_X/Hub_P*_Z
-    # so CATIA expects “X/Z” fields as you wanted.
-    hub_axis_name = "X"  # for the design table keys (your request)
+    # =========================================================
+    # CATIA design table (single configuration)
+    # =========================================================
 
     design_params = {
         "Config": ["Default"],
@@ -1013,26 +1238,29 @@ def main():
         "Tip_C2_P2_X": [tip_c2_top_3d[2, 0]], "Tip_C2_P2_Y": [tip_c2_top_3d[2, 1]], "Tip_C2_P2_Z": [tip_c2_top_3d[2, 2]],
         "Tip_C2_P3_X": [tip_c2_top_3d[3, 0]], "Tip_C2_P3_Y": [tip_c2_top_3d[3, 1]], "Tip_C2_P3_Z": [tip_c2_top_3d[3, 2]],
 
-        # Hub (UPDATED to X/Z naming in design table)
-        f"Hub_P0_{hub_axis_name}": [hub_cp_az[0, 0]], "Hub_P0_Z": [hub_cp_az[0, 1]],
-        f"Hub_P1_{hub_axis_name}": [hub_cp_az[1, 0]], "Hub_P1_Z": [hub_cp_az[1, 1]],
-        f"Hub_P2_{hub_axis_name}": [hub_cp_az[2, 0]], "Hub_P2_Z": [hub_cp_az[2, 1]],
-        f"Hub_P3_{hub_axis_name}": [hub_cp_az[3, 0]], "Hub_P3_Z": [hub_cp_az[3, 1]],
+        # Hub (X/Z naming)
+        "Hub_P0_X": [hub_cp_az[0, 0]], "Hub_P0_Z": [hub_cp_az[0, 1]],
+        "Hub_P1_X": [hub_cp_az[1, 0]], "Hub_P1_Z": [hub_cp_az[1, 1]],
+        "Hub_P2_X": [hub_cp_az[2, 0]], "Hub_P2_Z": [hub_cp_az[2, 1]],
+        "Hub_P3_X": [hub_cp_az[3, 0]], "Hub_P3_Z": [hub_cp_az[3, 1]],
 
-        # Continuity residuals (handy debug)
+        # Continuity residuals
         "Join_C0_residual": [c0_res],
         "Join_C1_residual": [c1_res],
         "Join_C2_residual": [c2_res],
 
-        # Tip Curve 2 u=0.5 point + normal
-        "Tip_C2_u05_X": [load_point_3d[0]],
-        "Tip_C2_u05_Y": [load_point_3d[1]],
-        "Tip_C2_u05_Z": [load_point_3d[2]],
-        "Tip_C2_u05_NX": [normal_unit_3d[0]],
-        "Tip_C2_u05_NY": [normal_unit_3d[1]],
-        "Tip_C2_u05_NZ": [normal_unit_3d[2]],
+        # Abaqus (current selection)
+        "Abaqus_Target": [abaqus_target],
+        "Abaqus_u": [abaqus_u],
+        "Abaqus_LoadMag": [load_mag],
+        "LoadPoint_X": [load_point_3d[0]],
+        "LoadPoint_Y": [load_point_3d[1]],
+        "LoadPoint_Z": [load_point_3d[2]],
+        "LoadDir_X": [normal_unit_3d[0]],
+        "LoadDir_Y": [normal_unit_3d[1]],
+        "LoadDir_Z": [normal_unit_3d[2]],
 
-        # CFD domain extents
+        # CFD
         "CFD_Xmin": [cfd_x_min],
         "CFD_Xmax": [cfd_x_max],
         "CFD_Ymin": [cfd_y_min],
@@ -1054,184 +1282,31 @@ def main():
         root_blade_export.to_excel(writer, sheet_name="Blade_Root_CPs", index=False)
         tip_blade_export.to_excel(writer, sheet_name="Blade_Tip_CPs", index=False)
         hub_df_out_for_design.to_excel(writer, sheet_name="Hub_CPs", index=False)
+        variant_table.to_excel(writer, sheet_name="BladeVariants", index=False)
 
     design_table_bytes = buf_dt.getvalue()
 
-    # ---------- Blade geometry tab ----------
-    with tab_blade:
-        st.header("Blade geometry")
+    # Config template file: if present on disk, use it. Else generate a basic one.
+    template_bytes = read_template_bytes()
+    if template_bytes is None:
+        buf_cfg = BytesIO()
+        with pd.ExcelWriter(buf_cfg, engine="xlsxwriter") as writer:
+            default_variant_table().to_excel(writer, sheet_name="Table1_BladeVariants", index=False)
+            pd.DataFrame({"Name": ["NumBlades", "ScaleX", "ScaleZ", "TwistTotalDeg", "TwistSign", "AbaqusLoadMag", "AbaqusU", "AbaqusTarget"],
+                          "Value": [3, 0.8, 0.8, 15.0, +1, 1000.0, 0.5, "Tip_C2_Top"]}).to_excel(writer, sheet_name="Parameters", index=False)
+            # Optional sheets used by app if you fill them:
+            pd.DataFrame({"Section": ["Root"]*4, "Curve": [1]*4, "PointIndex": [0,1,2,3],
+                          "X": [1.0, 1.0, 0.8, 0.6], "Z": [0.0, 0.06, 0.08, 0.075]}).to_excel(writer, sheet_name="BezierControlPoints", index=False)
+            pd.DataFrame({"PointIndex": [0,1,2,3], "X": [-0.4, 0.3, 13.0, 2.0], "Z": [1.0, 1.0, 0.8, 0.0]}).to_excel(writer, sheet_name="HubControlPoints", index=False)
+        template_bytes = buf_cfg.getvalue()
 
-        if excel_loaded and excel_warnings:
-            for msg in excel_warnings:
-                st.info(msg)
+    # Abaqus Python script stub
+    script_lines = f"""# Abaqus script stub generated by CAE4 Streamlit tool
+# Target: {abaqus_target}, u={abaqus_u:.4f}
+# Load point: {tuple(load_point_3d)}
+# Load dir (unit): {tuple(normal_unit_3d)}
+# Load magnitude: {load_mag:.3f} N
 
-        st.markdown(
-            f"**Effective parameters used:**  "
-            f"`Num blades` = {num_blades}, "
-            f"`Blade length` = {blade_length_m:.2f} m, "
-            f"`Thickness` = {blade_thickness_m*1000:.2f} mm, "
-            f"`ScaleX` = {scale_x:.3f}, "
-            f"`ScaleZ` = {scale_z:.3f}, "
-            f"`Twist` = {twist_total_deg:.2f}° total ({twist_deg_per_m:.4f} °/m), sign={twist_sign:+.0f}."
-        )
-        st.markdown(f"Root Curve 1 CP source: **{used_c1_source}**")
-
-        st.subheader("C² join check (Root Curve 1 → Root Curve 2)")
-        st.write(pd.DataFrame(
-            {"Metric": ["C0 residual", "C1 residual", "C2 residual"],
-             "Value": [c0_res, c1_res, c2_res]}
-        ))
-
-        st.subheader("Root cross-section – top surface")
-        st.plotly_chart(make_root_top_plot(root_c1_cubic, root_c2_cubic), use_container_width=True)
-
-        st.subheader("Root & tip cross-sections – top and mirrored bottom")
-        fig = make_root_and_tip_plot(
-            root_c1_cubic, root_c2_cubic,
-            tip_c1_top_2d, tip_c2_top_2d,
-            tip_c1_bottom_2d, tip_c2_bottom_2d,
-            show_root=show_root, show_tip=show_tip,
-            x_range=x_range, z_range=z_range,
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.subheader("Tip Curve 2 – point at u = 0.5 and normal (for Abaqus load)")
-        df_load = pd.DataFrame(
-            {
-                "Quantity": ["Point X (m)", "Point Y (m)", "Point Z (m)", "Normal X (unit)", "Normal Y (unit)", "Normal Z (unit)"],
-                "Value": [load_point_3d[0], load_point_3d[1], load_point_3d[2], normal_unit_3d[0], normal_unit_3d[1], normal_unit_3d[2]],
-            }
-        )
-        st.table(df_load)
-
-        st.subheader("Control points for manufacturing – Blade")
-        st.markdown("**Root – cubic control points (top half, Y = 0)**")
-        st.dataframe(pd.concat([root_c1_df_out, root_c2_df_out], ignore_index=True))
-
-        st.markdown("**Tip – cubic control points (top half, Y = Blade length)**")
-        st.dataframe(pd.concat([tip_c1_df_out, tip_c2_df_out], ignore_index=True))
-
-        st.subheader("CATIA design table download (Blade + Hub + CFD + load)")
-        st.download_button(
-            "📥 Download CATIA design table (Excel)",
-            data=design_table_bytes,
-            file_name="blade_hub_cfd_design_table.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-        if export_sampled_points:
-            st.subheader("Sampled blade curve points (CSV)")
-            sampled_csv = sampled_blade_points_csv(
-                root_c1_cubic, root_c2_cubic,
-                tip_c1_top_2d, tip_c2_top_2d,
-                tip_c1_bottom_2d, tip_c2_bottom_2d,
-                blade_length_m,
-            )
-            st.download_button(
-                "Download sampled blade points (CSV)",
-                data=sampled_csv,
-                file_name="blade_sampled_points.csv",
-                mime="text/csv",
-            )
-
-        if cp_df is not None:
-            with st.expander("Show raw `BezierControlPoints` from Excel"):
-                st.dataframe(cp_df)
-
-    # ---------- 3D preview tab ----------
-    with tab_3d:
-        st.header("3D preview – Blade")
-        st.markdown("Simple 3D visualisation of the blade root and tip sections.")
-        st.plotly_chart(
-            make_blade_3d_plot(root_c1_cubic, root_c2_cubic, tip_c1_top_2d, tip_c2_top_2d, blade_length_m),
-            use_container_width=True
-        )
-
-    # ---------- Hub geometry tab ----------
-    with tab_hub:
-        st.header("Hub geometry")
-
-        st.markdown(f"Hub profile control points source: **{hub_source_label}**")
-        st.plotly_chart(make_hub_plot(hub_cp_az, hub_plane_label=hub_plane_label), use_container_width=True)
-
-        st.markdown(f"**Hub control points ({hub_plane_label})**")
-        hub_df_display = pd.DataFrame(hub_cp_az, columns=[f"{hub_plane_label.split('–')[0]} (m)", "Z (m)"])
-        hub_df_display.insert(0, "Point index", list(range(hub_cp_az.shape[0])))
-        st.dataframe(hub_df_display)
-
-        hub_csv = hub_df_display.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download hub control points (CSV)",
-            data=hub_csv,
-            file_name="hub_control_points.csv",
-            mime="text/csv",
-        )
-
-        st.markdown(
-            """
-            **CATIA note (important):**
-            - This app now exports hub points in **X–Z** by default.
-            - So your CATIA sketch plane/axis naming should match that convention.
-            - If you previously revolved a **Y–Z** sketch about the x-axis, you can still do that,
-              but then you should keep using Y–Z points. (This app will accept legacy Y–Z if present in Excel.)
-            """
-        )
-
-    # ---------- CFD domain tab ----------
-    with tab_cfd:
-        st.header("CFD domain sizing")
-        cfd_df = pd.DataFrame(
-            {
-                "Quantity": ["Chord length", "X-min (upstream)", "X-max (downstream)", "Y-min (radial)", "Y-max (radial)", "Z-min (vertical)", "Z-max (vertical)"],
-                "Value [m]": [chord_length, cfd_x_min, cfd_x_max, cfd_y_min, cfd_y_max, cfd_z_min, cfd_z_max],
-            }
-        )
-        st.table(cfd_df)
-
-        cfd_box_df = pd.DataFrame(
-            {"Param": ["Xmin", "Xmax", "Ymin", "Ymax", "Zmin", "Zmax", "Chord"],
-             "Value_m": [cfd_x_min, cfd_x_max, cfd_y_min, cfd_y_max, cfd_z_min, cfd_z_max, chord_length]}
-        )
-        cfd_csv = cfd_box_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download CFD domain parameters (CSV)",
-            data=cfd_csv,
-            file_name="cfd_domain_parameters.csv",
-            mime="text/csv",
-        )
-
-    # ---------- Abaqus config tab ----------
-    with tab_abaqus:
-        st.header("Abaqus configuration helpers")
-
-        st.subheader("Load point and normal vector")
-        df_load = pd.DataFrame(
-            {
-                "Quantity": ["Point X (m)", "Point Y (m)", "Point Z (m)", "Normal X (unit)", "Normal Y (unit)", "Normal Z (unit)"],
-                "Value": [load_point_3d[0], load_point_3d[1], load_point_3d[2], normal_unit_3d[0], normal_unit_3d[1], normal_unit_3d[2]],
-            }
-        )
-        st.table(df_load)
-
-        flip_normal = st.checkbox("Flip normal direction (if Abaqus load ends up pointing outwards)", value=False)
-        normal_for_abaqus = -normal_unit_3d if flip_normal else normal_unit_3d
-
-        load_data_df = pd.DataFrame(
-            {
-                "Quantity": ["LoadPoint_X_m", "LoadPoint_Y_m", "LoadPoint_Z_m", "LoadDir_X_unit", "LoadDir_Y_unit", "LoadDir_Z_unit"],
-                "Value": [load_point_3d[0], load_point_3d[1], load_point_3d[2], normal_for_abaqus[0], normal_for_abaqus[1], normal_for_abaqus[2]],
-            }
-        )
-        load_csv = load_data_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download load point & direction (CSV)",
-            data=load_csv,
-            file_name="abaqus_load_point_and_direction.csv",
-            mime="text/csv",
-        )
-
-        st.subheader("Abaqus Python script stub")
-        script_lines = f"""# Abaqus script stub generated by CAE4 Streamlit tool
 from abaqus import *
 from abaqusConstants import *
 import regionToolset
@@ -1242,10 +1317,16 @@ INSTANCE_NAME = 'BladeInstance'
 STEP_GEOMETRY_FILE = 'blade_geometry.step'  # TODO: replace with your geometry filename
 
 load_point = ({load_point_3d[0]:.6f}, {load_point_3d[1]:.6f}, {load_point_3d[2]:.6f})
-load_dir   = ({normal_for_abaqus[0]:.6f}, {normal_for_abaqus[1]:.6f}, {normal_for_abaqus[2]:.6f})
-load_mag   = 1000.0  # N
+load_dir   = ({normal_unit_3d[0]:.6f}, {normal_unit_3d[1]:.6f}, {normal_unit_3d[2]:.6f})
+load_mag   = {load_mag:.6f}  # N
 
-mdb.ModelFromInputFile(name=MODEL_NAME, inputFileName=STEP_GEOMETRY_FILE)
+# NOTE:
+# This stub assumes you already imported geometry into the model and the part/instance names match.
+# You may need to adjust PART_NAME / INSTANCE_NAME depending on your import workflow.
+
+# Example: open an existing model OR create/import based on your workflow.
+# mdb.ModelFromInputFile(name=MODEL_NAME, inputFileName=STEP_GEOMETRY_FILE)
+
 model = mdb.models[MODEL_NAME]
 part = model.parts[PART_NAME]
 
@@ -1270,14 +1351,178 @@ model.ConcentratedLoad(
     cf3=load_mag * load_dir[2],
 )
 
-print('Script setup complete. Check geometry, sets, and part names before running.')
+print('Script setup complete. Verify part/instance names, BCs, and meshing before running.')
 """
-        st.download_button(
-            "Download Abaqus Python script stub (.py)",
-            data=script_lines.encode("utf-8"),
-            file_name="abaqus_blade_load_stub.py",
-            mime="text/x-python",
+    script_bytes = script_lines.encode("utf-8")
+
+    # Place download buttons in the sidebar downloads expander (as requested)
+    with st.sidebar:
+        with downloads_placeholder.container():
+            with st.expander("Downloads", expanded=False):
+                st.download_button(
+                    "📥 Download CATIA design table (Excel)",
+                    data=design_table_bytes,
+                    file_name="blade_hub_cfd_design_table.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+                st.download_button(
+                    "📥 Download config template (Excel)",
+                    data=template_bytes,
+                    file_name="config_template.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+                st.download_button(
+                    "📥 Download Abaqus Python script stub (.py)",
+                    data=script_bytes,
+                    file_name="abaqus_blade_load_stub.py",
+                    mime="text/x-python",
+                )
+                # Optional exports re-added
+                hub_csv = hub_df_out_for_design.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download hub control points (CSV)",
+                    data=hub_csv,
+                    file_name="hub_control_points.csv",
+                    mime="text/csv",
+                )
+                cfd_box_df = pd.DataFrame(
+                    {"Param": ["Xmin", "Xmax", "Ymin", "Ymax", "Zmin", "Zmax", "Chord"],
+                     "Value_m": [cfd_x_min, cfd_x_max, cfd_y_min, cfd_y_max, cfd_z_min, cfd_z_max, chord_length]}
+                )
+                cfd_csv = cfd_box_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download CFD domain parameters (CSV)",
+                    data=cfd_csv,
+                    file_name="cfd_domain_parameters.csv",
+                    mime="text/csv",
+                )
+                sampled_csv = sampled_blade_points_csv(
+                    root_c1_cubic, root_c2_cubic,
+                    tip_c1_top_2d, tip_c2_top_2d,
+                    tip_c1_bottom_2d, tip_c2_bottom_2d,
+                    blade_length_m
+                )
+                st.download_button(
+                    "Download sampled blade points (CSV)",
+                    data=sampled_csv,
+                    file_name="blade_sampled_points.csv",
+                    mime="text/csv",
+                )
+
+    # ---------- Blade geometry tab ----------
+    with tab_blade:
+        st.header("Blade geometry")
+
+        st.markdown(
+            f"**Effective parameters used:**  "
+            f"`Num blades` = {num_blades}, "
+            f"`Blade length` = {blade_length_m:.2f} m, "
+            f"`Thickness` = {blade_thickness_m*1000:.2f} mm, "
+            f"`ScaleX` = {scale_x:.3f}, "
+            f"`ScaleZ` = {scale_z:.3f}, "
+            f"`Twist` = {twist_total_deg:.2f}° total ({twist_deg_per_m:.4f} °/m), sign={twist_sign:+.0f}."
         )
+
+        st.subheader("Root cross-section – top surface")
+        st.plotly_chart(make_root_top_plot(root_c1_cubic, root_c2_cubic), use_container_width=True)
+
+        st.subheader("Root & tip cross-sections – top and mirrored bottom")
+        fig = make_root_and_tip_plot(
+            root_c1_cubic, root_c2_cubic,
+            tip_c1_top_2d, tip_c2_top_2d,
+            tip_c1_bottom_2d, tip_c2_bottom_2d,
+            show_root=bool(st.session_state.show_root),
+            show_tip=bool(st.session_state.show_tip),
+            x_range=x_range, z_range=z_range,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("Continuity check at Curve 1 → Curve 2 join (Root top)")
+        st.table(pd.DataFrame(
+            {"Residual": ["C0", "C1", "C2"], "Value": [c0_res, c1_res, c2_res]}
+        ))
+
+        st.subheader("Tip Curve (selected Abaqus target) – point and normal")
+        df_load = pd.DataFrame(
+            {
+                "Quantity": [
+                    "Point X (m)",
+                    "Point Y (m)",
+                    "Point Z (m)",
+                    "Normal X (unit)",
+                    "Normal Y (unit)",
+                    "Normal Z (unit)",
+                ],
+                "Value": [
+                    load_point_3d[0],
+                    load_point_3d[1],
+                    load_point_3d[2],
+                    normal_unit_3d[0],
+                    normal_unit_3d[1],
+                    normal_unit_3d[2],
+                ],
+            }
+        )
+        st.table(df_load)
+
+        st.subheader("Control points for manufacturing – Blade")
+        st.markdown("**Root – cubic control points (top half, Y = 0)**")
+        st.dataframe(pd.concat([root_c1_df_out, root_c2_df_out], ignore_index=True))
+
+        st.markdown("**Tip – cubic control points (top half, Y = Blade length)**")
+        st.dataframe(pd.concat([tip_c1_df_out, tip_c2_df_out], ignore_index=True))
+
+    # ---------- 3D preview tab ----------
+    with tab_3d:
+        st.header("3D preview – Blade")
+        st.markdown(
+            "Simple 3D visualisation of the blade root and tip sections, with a few spanwise ribs "
+            "to give an impression of twist and taper."
+        )
+        st.plotly_chart(
+            make_blade_3d_plot(root_c1_cubic, root_c2_cubic, tip_c1_top_2d, tip_c2_top_2d, blade_length_m),
+            use_container_width=True
+        )
+
+    # ---------- Hub geometry tab ----------
+    with tab_hub:
+        st.header("Hub geometry")
+        st.markdown(f"Hub profile control points source: **{hub_source_label}**")
+        st.plotly_chart(make_hub_plot(hub_cp_az, hub_plane_label=hub_plane_label), use_container_width=True)
+
+        st.markdown("**Hub control points**")
+        st.dataframe(hub_df_out_for_design)
+
+    # ---------- CFD domain tab ----------
+    with tab_cfd:
+        st.header("CFD domain sizing")
+        cfd_df = pd.DataFrame(
+            {
+                "Quantity": [
+                    "Chord length",
+                    "X-min (upstream)",
+                    "X-max (downstream)",
+                    "Y-min (radial)",
+                    "Y-max (radial)",
+                    "Z-min (vertical)",
+                    "Z-max (vertical)",
+                ],
+                "Value [m]": [
+                    chord_length, cfd_x_min, cfd_x_max, cfd_y_min, cfd_y_max, cfd_z_min, cfd_z_max
+                ],
+            }
+        )
+        st.table(cfd_df)
+
+    # ---------- Abaqus config tab ----------
+    with tab_abaqus:
+        st.header("Abaqus configuration helpers")
+
+        st.subheader("Load point and normal vector (from selected target in sidebar)")
+        st.table(df_load)
+
+        st.subheader("Abaqus Python script stub (preview)")
+        st.code(script_lines, language="python")
 
 
 if __name__ == "__main__":

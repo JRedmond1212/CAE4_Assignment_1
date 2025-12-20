@@ -157,6 +157,7 @@ def default_variant_table() -> pd.DataFrame:
         }
     )
 
+
 def parse_variant_table_from_excel(xls: pd.ExcelFile) -> Optional[pd.DataFrame]:
     """
     Try hard to find a blade variant table in the uploaded config.
@@ -203,6 +204,7 @@ def parse_variant_table_from_excel(xls: pd.ExcelFile) -> Optional[pd.DataFrame]:
             if len(out) >= 1:
                 return out.reset_index(drop=True)
     return None
+
 
 def blade_length_and_thickness_from_table(num_blades: int, table: pd.DataFrame) -> Tuple[float, float]:
     sub = table[table["NumBlades"] == int(num_blades)]
@@ -288,10 +290,6 @@ def load_hub_control_points(excel_file_like):
     Supports BOTH:
       - Columns: X, Z   (preferred)
       - Columns: Y, Z   (legacy fallback)
-
-    Returns:
-      (cp, used_plane_label) where cp is Nx2 and label is "X–Z" or "Y–Z"
-      or (None, None)
     """
     try:
         xls = pd.ExcelFile(excel_file_like)
@@ -824,21 +822,17 @@ def ensure_state_defaults():
 
     # Abaqus defaults
     st.session_state.abaqus_load_mag = 1000.0
-    st.session_state.abaqus_u = 0.5
+    st.session_state.abaqus_u = 0.50
     st.session_state.abaqus_flip_normal = False
-
-    # We keep the UI target list, but the NEW Abaqus script is designed
-    # specifically to load "Tip_C2_Top" by partitioning its tip edge.
-    st.session_state.abaqus_target = "Tip_C2_Top"
 
     # Abaqus model database defaults
     st.session_state.abaqus_model_name = "Model-1"
-    st.session_state.abaqus_part_name = "Model-1"      # your imported part name
+    st.session_state.abaqus_part_name = "Blade"
     st.session_state.abaqus_instance_name = "Blade-1"
     st.session_state.abaqus_material_name = "BladeMaterial"
     st.session_state.abaqus_E = 70e9
     st.session_state.abaqus_nu = 0.33
-    st.session_state.abaqus_mesh_seed = 0.50          # "meters-ish"; Abaqus script tolerances are bbox-driven
+    st.session_state.abaqus_mesh_seed = 0.25
     st.session_state.abaqus_job_name = "BladeJob"
     st.session_state.abaqus_step_name = "Step-1"
 
@@ -913,8 +907,11 @@ def apply_config_once_if_new(uploaded_bytes: bytes) -> Tuple[bool, List[str], pd
             try_set_float("abaqus_load_mag", "AbaqusLoadMag")
         if "AbaqusU" in params:
             try_set_float("abaqus_u", "AbaqusU")
-        if "AbaqusTarget" in params:
-            st.session_state.abaqus_target = str(params["AbaqusTarget"])
+        if "AbaqusFlipNormal" in params:
+            try:
+                st.session_state.abaqus_flip_normal = bool(int(float(params["AbaqusFlipNormal"])))
+            except Exception:
+                warnings.append("AbaqusFlipNormal invalid; ignored.")
 
         # Abaqus material overrides
         if "AbaqusMaterialName" in params:
@@ -959,133 +956,191 @@ def apply_config_once_if_new(uploaded_bytes: bytes) -> Tuple[bool, List[str], pd
         st.session_state.hub_p1_x = float(hub_cp[1, 0]); st.session_state.hub_p1_z = float(hub_cp[1, 1])
         st.session_state.hub_p2_x = float(hub_cp[2, 0]); st.session_state.hub_p2_z = float(hub_cp[2, 1])
         st.session_state.hub_p3_x = float(hub_cp[3, 0]); st.session_state.hub_p3_z = float(hub_cp[3, 1])
-    elif hub_cp is None:
-        warnings.append("No valid HubControlPoints found in config; using current hub defaults.")
 
     return applied, warnings, variant_table
 
 
 # =========================================================
-# Abaqus script generator (POST-IMPORT) - TIP CURVE2 TOP PARTITION-BY-U
+# Abaqus script generator - USES YOUR PROVIDED ABAQUS.PY TEMPLATE
 # =========================================================
 
-def generate_abaqus_post_import_script_tip_curve2_partition_u(
+def generate_abaqus_script_from_your_template(
     model_name: str,
     part_name: str,
     instance_name: str,
     material_name: str,
-    E: float,
-    nu: float,
-    shell_thickness: float,
-    mesh_seed: float,
     step_name: str,
     job_name: str,
-    # from Streamlit geometry:
+    E: float,
+    nu: float,
+    shell_t: float,
+    mesh_seed: float,
     load_u: float,
-    load_mag: float,
-    # hint point near tip curve2-top at chosen u, in (x,z)
-    load_point_hint_xz: Tuple[float, float],
-    # force direction unit (x,y,z) computed from the Bezier tangent/normal (y is 0 here)
-    force_dir_unit_xyz: Tuple[float, float, float],
-    flip_dir: bool,
-):
-    hx, hz = float(load_point_hint_xz[0]), float(load_point_hint_xz[1])
-    dx, dy, dz = float(force_dir_unit_xyz[0]), float(force_dir_unit_xyz[1]), float(force_dir_unit_xyz[2])
+    load_point_xyz: Tuple[float, float, float],
+    force_vec_xyz: Tuple[float, float, float],
+) -> str:
+    # Guard: avoid u=0 or u=1 which can break PartitionEdgeByParam
+    u = float(load_u)
+    u = min(max(u, 1e-6), 1.0 - 1e-6)
 
-    # Apply flip in script so the generated code is self-consistent
-    if flip_dir:
-        dx, dy, dz = -dx, -dy, -dz
+    lx, ly, lz = [float(v) for v in load_point_xyz]
+    fx, fy, fz = [float(v) for v in force_vec_xyz]
 
-    # Force vector in global coords
-    fx, fy, fz = load_mag * dx, load_mag * dy, load_mag * dz
-
-    # NOTE:
-    # - We DO NOT use Streamlit's "blade_length_m" directly inside Abaqus selection.
-    # - We detect tip_y from the PART bbox (robust to mm vs m).
-    # - We find "tip plane edges" by bounding box y ~ tip_y.
-    # - We choose the best edge by closeness to the hint point (x,z).
-    # - We partition that edge by param u (PartitionEdgeByParam).
-    # - Then we find the created vertex (closest to hint) and apply load to closest mesh node to that vertex.
     return f"""# -*- coding: utf-8 -*-
 # Abaqus/CAE script (POST-IMPORT) generated by Streamlit
-# Goal: Apply a concentrated load on TIP Curve2 TOP at parameter u by:
-#   1) detect tip plane Y from bbox
-#   2) identify the correct tip edge using a (x,z) hint
-#   3) partition the edge by param u (PartitionEdgeByParam)
-#   4) mesh
-#   5) apply load at the node closest to the partition vertex
-#
-# IMPORTANT: This script intentionally has NO "fallback continue" logic.
-# If a stage fails, it raises and stops so you can fix the root cause.
+# Assumes your blade part already exists in the model database.
 
 from abaqus import mdb
 from abaqusConstants import *
 import regionToolset
 import mesh
+import math
 
-MODEL_NAME    = r\"{model_name}\"
-PART_NAME     = r\"{part_name}\"
-INSTANCE_NAME = r\"{instance_name}\"
-MATERIAL_NAME = r\"{material_name}\"
-STEP_NAME     = r\"{step_name}\"
-JOB_NAME      = r\"{job_name}\"
+# =========================================================
+# USER INPUTS (match your model tree)
+# =========================================================
+MODEL_NAME    = r"{model_name}"
+PART_NAME     = r"{part_name}"
+INSTANCE_NAME = r"{instance_name}"
 
+MATERIAL_NAME = r"{material_name}"
+STEP_NAME     = r"{step_name}"
+JOB_NAME      = r"{job_name}"
+
+# Material / section
 E       = {E:.16g}
 NU      = {nu:.16g}
-SHELL_T = {shell_thickness:.16g}
+SHELL_T = {shell_t:.16g}
+
+# Mesh
 MESH_SEED = {mesh_seed:.16g}
 
-LOAD_U = {float(load_u):.16g}
-LOAD_POINT_HINT_XZ = ({hx:.16g}, {hz:.16g})
+# Load definition (from Streamlit)
+LOAD_U = {u:.16g}
+LOAD_POINT = ({lx:.16g}, {ly:.16g}, {lz:.16g})
+FORCE_VEC  = ({fx:.16g}, {fy:.16g}, {fz:.16g})
 
-FORCE_VEC = ({fx:.16g}, {fy:.16g}, {fz:.16g})
+# =========================================================
+# UNIT HANDLING
+# =========================================================
+AUTO_UNIT_SCALE = True
+UNIT_SCALE = 1.0
+# If AUTO_UNIT_SCALE=True, UNIT_SCALE will be inferred from geometry vs LOAD_POINT.y
 
+# =========================================================
+# Logging
+# =========================================================
 def log(msg):
-    print('>>> ' + str(msg))
+    print(">>> " + str(msg))
 
-def fail(msg):
+def die(msg):
     raise RuntimeError(str(msg))
 
+# =========================================================
+# Basic getters
+# =========================================================
 def get_model():
     if MODEL_NAME not in mdb.models:
-        fail(\"Model '%s' not found in mdb.models\" % MODEL_NAME)
+        die("Model '%s' not found. Available models: %s" % (MODEL_NAME, list(mdb.models.keys())))
     return mdb.models[MODEL_NAME]
 
 def get_part(model):
     if PART_NAME not in model.parts:
-        fail(\"Part '%s' not found in model.parts\" % PART_NAME)
+        die("Part '%s' not found. Available parts: %s" % (PART_NAME, list(model.parts.keys())))
     return model.parts[PART_NAME]
 
 def get_or_create_instance(model, part_obj):
     a = model.rootAssembly
     if INSTANCE_NAME in a.instances:
+        log("Using existing instance: %s" % INSTANCE_NAME)
         return a.instances[INSTANCE_NAME]
 
     if len(a.instances) > 0:
-        # Reuse first instance if user already has one, to avoid duplicates
-        inst = a.instances.values()[0]
-        log(\"Instance '%s' not found; reusing first instance '%s'.\" % (INSTANCE_NAME, inst.name))
-        return inst
+        inst0 = a.instances.values()[0]
+        log("WARNING: Instance '%s' not found; reusing first existing instance: %s" % (INSTANCE_NAME, inst0.name))
+        return inst0
 
-    log(\"No instances found. Creating instance %s.\" % INSTANCE_NAME)
+    log("No instances found. Creating instance %s." % INSTANCE_NAME)
     a.DatumCsysByDefault(CARTESIAN)
     inst = a.Instance(name=INSTANCE_NAME, part=part_obj, dependent=ON)
     return inst
 
-def ensure_material_and_section(model, part_obj):
-    log(\"Ensuring material and shell section...\")
+# =========================================================
+# Bounding box WITHOUT part.getBoundingBox()
+# =========================================================
+def bbox_from_part_geometry(part_obj):
+    \"\"\"
+    Compute an approximate bounding box by sampling geometry points.
+    Works in Abaqus versions where Part.getBoundingBox() does not exist.
+    \"\"\"
+    pts = []
+
+    # Prefer vertices
+    try:
+        verts = part_obj.vertices
+        for v in verts:
+            p = v.pointOn[0]
+            pts.append((float(p[0]), float(p[1]), float(p[2])))
+    except Exception as ex:
+        log("WARNING: Could not read vertices for bbox: %s" % ex)
+
+    # Fallback: edge sample points
+    if len(pts) == 0:
+        try:
+            for e in part_obj.edges:
+                p = e.pointOn[0]
+                pts.append((float(p[0]), float(p[1]), float(p[2])))
+        except Exception as ex:
+            die("Failed to compute bbox from geometry points (no vertices/edges usable): %s" % ex)
+
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    zs = [p[2] for p in pts]
+
+    low  = (min(xs), min(ys), min(zs))
+    high = (max(xs), max(ys), max(zs))
+    return low, high
+
+def detect_unit_scale_from_geometry(part_obj, load_point):
+    low, high = bbox_from_part_geometry(part_obj)
+    y_min, y_max = float(low[1]), float(high[1])
+    tip_y = y_max
+    root_y = y_min
+
+    lp_y = float(load_point[1])
+    if not AUTO_UNIT_SCALE:
+        return 1.0, root_y, tip_y, low, high
+
+    if abs(lp_y) < 1e-12:
+        return 1.0, root_y, tip_y, low, high
+
+    ratio = abs(tip_y / lp_y)
+
+    if 200.0 < ratio < 5000.0:
+        scale = ratio
+        log("AUTO_UNIT_SCALE: Detected geometry/load mismatch.")
+        log("  tip_y ≈ %.6g, LOAD_POINT.y = %.6g, ratio ≈ %.6g -> using UNIT_SCALE=%.6g" % (tip_y, lp_y, ratio, scale))
+        return scale, root_y, tip_y, low, high
+
+    return 1.0, root_y, tip_y, low, high
+
+# =========================================================
+# Material and section
+# =========================================================
+def ensure_material_and_section(model, part_obj, shell_t):
+    log("Ensuring material and shell section...")
     if MATERIAL_NAME not in model.materials:
         mat = model.Material(name=MATERIAL_NAME)
         mat.Elastic(table=((E, NU),))
-        log(\"Created material: %s\" % MATERIAL_NAME)
+        log("Created material: %s" % MATERIAL_NAME)
 
-    sec_name = \"BladeShellSection\"
+    sec_name = "BladeShellSection"
     if sec_name not in model.sections:
         model.HomogeneousShellSection(
             name=sec_name,
             material=MATERIAL_NAME,
             thicknessType=UNIFORM,
-            thickness=SHELL_T,
+            thickness=shell_t,
             poissonDefinition=DEFAULT,
             thicknessModulus=None,
             temperature=GRADIENT,
@@ -1093,225 +1148,224 @@ def ensure_material_and_section(model, part_obj):
             integrationRule=SIMPSON,
             numIntPts=5,
         )
-        log(\"Created section: %s\" % sec_name)
+        log("Created section: %s (thickness=%.6g)" % (sec_name, shell_t))
 
     faces = part_obj.faces
     if len(faces) == 0:
-        fail(\"Part has no faces. Is this a shell/surface part?\")
+        die("Part has no faces. Are you sure the imported blade is a shell/surface part?")
+
     region = regionToolset.Region(faces=faces)
     part_obj.SectionAssignment(
         region=region,
         sectionName=sec_name,
         offset=0.0,
         offsetType=MIDDLE_SURFACE,
-        offsetField=\"\",
-        thicknessAssignment=FROM_SECTION
+        offsetField="",
+        thicknessAssignment=FROM_SECTION,
     )
-    log(\"Assigned section to all faces.\")
+    log("Assigned section to all faces.")
 
 def ensure_step(model):
-    log(\"Ensuring analysis step...\")
+    log("Ensuring analysis step...")
     if STEP_NAME in model.steps:
-        log(\"Step exists: %s\" % STEP_NAME)
+        log("Step exists: %s" % STEP_NAME)
         return
-    model.StaticStep(name=STEP_NAME, previous=\"Initial\")
-    log(\"Created step: %s\" % STEP_NAME)
+    model.StaticStep(name=STEP_NAME, previous="Initial")
+    log("Created step: %s" % STEP_NAME)
 
-def detect_tip_y_and_tol(part_obj):
-    log(\"Detecting tip Y (span direction) from geometry...\")
-    bb = part_obj.getBoundingBox()
-    lo = bb['low']; hi = bb['high']
-    x0,y0,z0 = lo[0],lo[1],lo[2]
-    x1,y1,z1 = hi[0],hi[1],hi[2]
-    log(\"BBox: x=[%s, %s], y=[%s, %s], z=[%s, %s]\" % (x0,x1,y0,y1,z0,z1))
-    tip_y = y1
-    tol_y = max(1e-6, 1e-4*abs(tip_y) if abs(tip_y) > 0 else 1e-6)
-    log(\"Detected tip_y = y_max = %s, tol_y = %s\" % (tip_y, tol_y))
-    if abs(tip_y) > 1000.0:
-        log(\"NOTE: tip_y is large -> model likely in mm (or similar). That's OK; script uses bbox-based tolerances.\")
-    return tip_y, tol_y, (x0,x1,y0,y1,z0,z1)
+# =========================================================
+# Edge selection: Curve2 top at tip (STRICT)
+# =========================================================
+def edge_avg_point(edge_obj):
+    pts = edge_obj.pointOn
+    xs = [float(p[0]) for p in pts]
+    ys = [float(p[1]) for p in pts]
+    zs = [float(p[2]) for p in pts]
+    return (sum(xs)/len(xs), sum(ys)/len(ys), sum(zs)/len(zs))
 
-def apply_root_pinned_bc(model, inst, tol_y):
-    log(\"Stage: apply root pinned BC\")
-    edges = inst.edges.getByBoundingBox(
-        xMin=-1e99, xMax=1e99,
-        yMin=-tol_y, yMax=+tol_y,
-        zMin=-1e99, zMax=1e99
+def dist3(a, b):
+    return math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2)
+
+def find_tip_top_edge_near_loadpoint(inst, tip_y, tol_y, load_point):
+    log("Finding tip top edge nearest LOAD_POINT on tip plane...")
+
+    tip_edges = inst.edges.getByBoundingBox(
+        xMin=-1e20, xMax=1e20,
+        yMin=tip_y - tol_y, yMax=tip_y + tol_y,
+        zMin=-1e20, zMax=1e20
     )
+    log("Tip-plane edges found: %d" % len(tip_edges))
+    if len(tip_edges) == 0:
+        die("No edges found near tip plane y=%.6g (tol=%.6g). Check span direction and geometry." % (tip_y, tol_y))
+
+    top_edges = []
+    for e in tip_edges:
+        p = edge_avg_point(e)
+        if p[2] >= 0.0:
+            top_edges.append(e)
+    log("Top tip edges (z>=0) candidates: %d" % len(top_edges))
+    if len(top_edges) == 0:
+        die("Found tip-plane edges, but none qualify as TOP (z>=0). Check coordinate system / sign convention.")
+
+    best = None
+    best_d = None
+    best_p = None
+    for e in top_edges:
+        p = edge_avg_point(e)
+        d = dist3(p, load_point)
+        if (best is None) or (d < best_d):
+            best = e
+            best_d = d
+            best_p = p
+
+    if best is None:
+        die("Failed to pick a best tip top edge (unexpected).")
+
+    log("Selected tip-top edge: index=%s, avgPt=(%.6g, %.6g, %.6g), dist_to_LOAD_POINT≈%.6g"
+        % (str(best.index), best_p[0], best_p[1], best_p[2], best_d))
+    return best
+
+# =========================================================
+# Partition edge by parameter u (STRICT)
+# =========================================================
+def partition_edge_by_u(part_obj, inst_edge, u_param):
+    log("Partitioning selected tip edge at u=%.4f ..." % float(u_param))
+
+    try:
+        part_edge = part_obj.edges[inst_edge.index]
+    except Exception as ex:
+        die("Could not map instance edge to part edge using index=%s: %s" % (str(inst_edge.index), ex))
+
+    try:
+        part_obj.PartitionEdgeByParam(edges=(part_edge,), parameter=float(u_param))
+    except Exception as ex:
+        die("PartitionEdgeByParam failed. (u=%.4f) Error: %s" % (float(u_param), ex))
+
+    log("PartitionEdgeByParam succeeded at u=%.4f" % float(u_param))
+
+# =========================================================
+# Root BC
+# =========================================================
+def apply_root_pinned_bc(model, inst, root_y, tol_y):
+    log("Applying pinned BC at root (y≈%.6g, tol=%.6g)..." % (root_y, tol_y))
+
+    edges = inst.edges.getByBoundingBox(
+        xMin=-1e20, xMax=1e20,
+        yMin=root_y - tol_y, yMax=root_y + tol_y,
+        zMin=-1e20, zMax=1e20
+    )
+    log("Root-plane edges found: %d" % len(edges))
     if len(edges) == 0:
-        fail(\"No root edges found near y=0 (within tol_y). Check coordinate system.\")
-    set_name = \"SET_ROOT_EDGES\"
-    if set_name in inst.sets:
-        del inst.sets[set_name]
-    inst.Set(name=set_name, edges=edges)
-    region = inst.sets[set_name]
-    bc_name = \"BC_ROOT_PINNED\"
+        die("No root edges found near y=%.6g (tol=%.6g). Check span direction." % (root_y, tol_y))
+
+    a = model.rootAssembly
+    set_name = "SET_ROOT_EDGES"
+    if set_name in a.sets:
+        del a.sets[set_name]
+    a.Set(name=set_name, edges=edges)
+
+    region = a.sets[set_name]
+    bc_name = "BC_ROOT_PINNED"
     if bc_name in model.boundaryConditions:
         del model.boundaryConditions[bc_name]
+
     model.DisplacementBC(
         name=bc_name,
-        createStepName=\"Initial\",
+        createStepName="Initial",
         region=region,
         u1=0.0, u2=0.0, u3=0.0,
         ur1=UNSET, ur2=UNSET, ur3=UNSET,
         amplitude=UNSET,
         distributionType=UNIFORM,
-        fieldName=\"\",
+        fieldName="",
         localCsys=None
     )
-    log(\"Applied pinned BC on %d root edges.\" % len(edges))
+    log("Pinned BC applied on root edges.")
 
-def _edge_midpoint(edge):
-    # Edge.pointOn is a tuple of tuples: e.g. ((x,y,z),)
-    p = edge.pointOn[0]
-    return (float(p[0]), float(p[1]), float(p[2]))
+# =========================================================
+# Meshing
+# =========================================================
+def mesh_part(part_obj, mesh_seed):
+    log("Meshing part (seed=%.6g)..." % float(mesh_seed))
 
-def find_tip_curve2_top_edge(inst, tip_y, tol_y):
-    log(\"Stage: identify Curve2-top tip edge\")
-    log(\"Finding candidate edges on the tip plane (y ~ tip_y)...\")
-    tip_edges = inst.edges.getByBoundingBox(
-        xMin=-1e99, xMax=1e99,
-        yMin=tip_y - tol_y, yMax=tip_y + tol_y,
-        zMin=-1e99, zMax=1e99
-    )
-    if len(tip_edges) == 0:
-        fail(\"No edges found on tip plane. Check that blade span is along +Y.\")
-
-    log(\"Tip edges found: %d\" % len(tip_edges))
-
-    # Choose edge closest (in XZ) to hint point.
-    hx, hz = LOAD_POINT_HINT_XZ
-    best_e = None
-    best_d2 = None
-
-    for e in tip_edges:
-        xm, ym, zm = _edge_midpoint(e)
-        d2 = (xm - hx)*(xm - hx) + (zm - hz)*(zm - hz)
-        if best_d2 is None or d2 < best_d2:
-            best_d2 = d2
-            best_e = e
-
-    if best_e is None:
-        fail(\"Failed to select a tip edge (unexpected).\")
-
-    log(\"Selected tip edge by XZ-hint. best_d2=%s\" % best_d2)
-    return best_e
-
-def partition_edge_by_u(part_obj, inst, edge_inst, u):
-    log(\"Stage: partition edge at LOAD_U\")
-    if u <= 0.0 or u >= 1.0:
-        fail(\"LOAD_U must be strictly between 0 and 1 for partitioning. Got %s\" % u)
-
-    # We must partition the PART edge, not the INSTANCE edge.
-    # So, locate the corresponding part edge using a point on the instance edge.
-    p = edge_inst.pointOn[0]
-    x,y,z = float(p[0]), float(p[1]), float(p[2])
-
-    # findAt expects a sequence of coordinates
-    try:
-        edge_part = part_obj.edges.findAt(((x,y,z),))
-    except Exception as ex:
-        fail(\"Could not map instance edge to part edge using findAt. Error: %s\" % ex)
-
-    log(\"Partitioning part edge by param u=%s ...\" % u)
-    try:
-        part_obj.PartitionEdgeByParam(edges=edge_part, parameter=u)
-    except Exception as ex:
-        fail(\"PartitionEdgeByParam failed. Error: %s\" % ex)
-
-    log(\"PartitionEdgeByParam succeeded.\")
-
-def mesh_part(part_obj):
-    log(\"Stage: mesh part\")
     try:
         part_obj.setMeshControls(regions=part_obj.faces, elemShape=QUAD, technique=FREE)
     except Exception:
         pass
 
-    if MESH_SEED <= 0.0:
-        fail(\"MESH_SEED must be > 0\")
-
-    part_obj.seedPart(size=MESH_SEED, deviationFactor=0.1, minSizeFactor=0.1)
+    part_obj.seedPart(size=float(mesh_seed), deviationFactor=0.1, minSizeFactor=0.1)
 
     elemType1 = mesh.ElemType(elemCode=S4R, elemLibrary=STANDARD)
     elemType2 = mesh.ElemType(elemCode=S3,  elemLibrary=STANDARD)
     part_obj.setElementType(regions=(part_obj.faces,), elemTypes=(elemType1, elemType2))
 
     part_obj.generateMesh()
-    log(\"Meshing complete.\")
+    log("Mesh generated.")
 
-def apply_load_at_partition_vertex(model, inst, tip_y, tol_y):
-    log(\"Stage: apply load at partition vertex (closest to hint)\")
-    # After partition + mesh, the partition creates a vertex on that tip edge.
-    # We find the vertex on the tip plane closest to hint, then apply load at closest node to that vertex.
+# =========================================================
+# Closest node robust handling
+# =========================================================
+def closest_node(nodes_obj, xyz):
+    res = nodes_obj.getClosest(coordinates=xyz)
 
-    verts = inst.vertices.getByBoundingBox(
-        xMin=-1e99, xMax=1e99,
-        yMin=tip_y - tol_y, yMax=tip_y + tol_y,
-        zMin=-1e99, zMax=1e99
-    )
-    if len(verts) == 0:
-        fail(\"No vertices found on tip plane after partition. Partition probably did not create a vertex where expected.\")
+    if hasattr(res, "label"):
+        return res
 
-    hx, hz = LOAD_POINT_HINT_XZ
-    best_v = None
-    best_d2 = None
-    for v in verts:
-        p = v.pointOn[0]
-        x,z = float(p[0]), float(p[2])
-        d2 = (x-hx)*(x-hx) + (z-hz)*(z-hz)
-        if best_d2 is None or d2 < best_d2:
-            best_d2 = d2
-            best_v = v
+    if isinstance(res, (list, tuple)):
+        if len(res) == 0:
+            return None
+        first = res[0]
+        if isinstance(first, (list, tuple)) and len(first) >= 1 and hasattr(first[0], "label"):
+            return first[0]
+        if hasattr(first, "label"):
+            return first
 
-    if best_v is None:
-        fail(\"Failed to choose a tip vertex (unexpected).\")
+    return None
 
-    pv = best_v.pointOn[0]
-    vx, vy, vz = float(pv[0]), float(pv[1]), float(pv[2])
-    log(\"Chosen vertex: (x,y,z)=(%s,%s,%s)  d2=%s\" % (vx,vy,vz,best_d2))
+def apply_concentrated_force_at_loadpoint(model, inst, load_point, force_vec):
+    log("Applying concentrated force at closest node to LOAD_POINT...")
 
-    # Must have mesh nodes
     nodes = inst.nodes
     if len(nodes) == 0:
-        fail(\"No nodes on instance. Meshing likely failed.\")
-    res = nodes.getClosest(coordinates=(vx, vy, vz))
-    if res is None or len(res) == 0:
-        fail(\"getClosest returned no nodes near partition vertex.\")
+        die("No mesh nodes on instance. Meshing failed or not generated.")
 
-    first = res[0]
-    try:
-        node_obj = first[0]
-    except Exception:
-        node_obj = first
+    node_obj = closest_node(nodes, load_point)
+    if node_obj is None:
+        die("Could not find closest node to LOAD_POINT=%s. Check mesh and coordinates." % str(load_point))
 
-    set_name = \"SET_LOAD_NODE\"
-    if set_name in inst.sets:
-        del inst.sets[set_name]
-    inst.Set(name=set_name, nodes=nodes.sequenceFromLabels((node_obj.label,)))
-    region = inst.sets[set_name]
+    log("Closest node label=%d at approx LOAD_POINT=%s" % (int(node_obj.label), str(load_point)))
 
-    load_name = \"LOAD_F\"
+    a = model.rootAssembly
+    set_name = "SET_LOAD_NODE"
+    if set_name in a.sets:
+        del a.sets[set_name]
+    a.Set(name=set_name, nodes=inst.nodes.sequenceFromLabels((node_obj.label,)))
+
+    load_name = "LOAD_F"
     if load_name in model.loads:
         del model.loads[load_name]
 
     model.ConcentratedForce(
         name=load_name,
         createStepName=STEP_NAME,
-        region=region,
-        cf1=FORCE_VEC[0],
-        cf2=FORCE_VEC[1],
-        cf3=FORCE_VEC[2],
+        region=a.sets[set_name],
+        cf1=float(force_vec[0]),
+        cf2=float(force_vec[1]),
+        cf3=float(force_vec[2]),
         distributionType=UNIFORM,
-        field=\"\",
+        field="",
         localCsys=None
     )
-    log(\"Applied concentrated force at node label %d\" % node_obj.label)
+    log("Concentrated force applied: (%.6g, %.6g, %.6g) N" % (force_vec[0], force_vec[1], force_vec[2]))
 
-def make_job_and_run(model):
-    log(\"Stage: job submit\")
+# =========================================================
+# Job
+# =========================================================
+def make_job_and_run():
+    log("Creating and running job: %s" % JOB_NAME)
     if JOB_NAME in mdb.jobs:
         del mdb.jobs[JOB_NAME]
+
     mdb.Job(
         name=JOB_NAME,
         model=MODEL_NAME,
@@ -1329,43 +1383,72 @@ def make_job_and_run(model):
     )
     mdb.jobs[JOB_NAME].submit(consistencyChecking=OFF)
     mdb.jobs[JOB_NAME].waitForCompletion()
-    log(\"Job completed.\")
+    log("Job completed.")
 
+# =========================================================
+# MAIN
+# =========================================================
 def main():
-    log(\"===== START POST-IMPORT BLADE SCRIPT =====\")
+    log("===== START POST-IMPORT BLADE SCRIPT =====")
+
     model = get_model()
     part_obj = get_part(model)
     inst = get_or_create_instance(model, part_obj)
-    log(\"Using model='%s', part='%s', instance='%s'\" % (MODEL_NAME, part_obj.name, inst.name))
 
-    ensure_material_and_section(model, part_obj)
+    log("Stage: detect geometry extents / unit scale")
+    inferred_scale, root_y_raw, tip_y_raw, bb_low, bb_high = detect_unit_scale_from_geometry(part_obj, LOAD_POINT)
+
+    global UNIT_SCALE
+    UNIT_SCALE = inferred_scale if AUTO_UNIT_SCALE else UNIT_SCALE
+
+    log("BBox (geometry sample): low=%s high=%s" % (str(bb_low), str(bb_high)))
+    log("Detected root_y=%.6g, tip_y=%.6g" % (float(root_y_raw), float(tip_y_raw)))
+
+    shell_t_scaled = float(SHELL_T) * float(UNIT_SCALE)
+    mesh_seed_scaled = float(MESH_SEED) * float(UNIT_SCALE)
+    load_point_scaled = (float(LOAD_POINT[0]) * float(UNIT_SCALE),
+                         float(LOAD_POINT[1]) * float(UNIT_SCALE),
+                         float(LOAD_POINT[2]) * float(UNIT_SCALE))
+
+    log("UNIT_SCALE=%.6g" % float(UNIT_SCALE))
+    log("Scaled: SHELL_T=%.6g, MESH_SEED=%.6g, LOAD_POINT=%s"
+        % (shell_t_scaled, mesh_seed_scaled, str(load_point_scaled)))
+
+    span = float(tip_y_raw - root_y_raw)
+    tol_y = max(1e-6, 1e-4 * abs(span) if abs(span) > 0 else 1e-6)
+    log("tol_y=%.6g (based on span=%.6g)" % (tol_y, span))
+
+    log("Stage: material + section")
+    ensure_material_and_section(model, part_obj, shell_t_scaled)
+
+    log("Stage: step")
     ensure_step(model)
 
-    # Detect tip Y and tolerances from bbox (robust to mm vs m)
-    tip_y, tol_y, _bbox = detect_tip_y_and_tol(part_obj)
+    log("Stage: identify tip top edge near LOAD_POINT")
+    curve2_tip_edge = find_tip_top_edge_near_loadpoint(inst, tip_y_raw, tol_y, load_point_scaled)
 
-    # Identify the correct TIP Curve2-top edge from hint point (must succeed)
-    edge_tip = find_tip_curve2_top_edge(inst, tip_y, tol_y)
+    log("Stage: partition selected edge at u")
+    partition_edge_by_u(part_obj, curve2_tip_edge, LOAD_U)
 
-    # Partition that edge by parameter u (must succeed)
-    partition_edge_by_u(part_obj, inst, edge_tip, LOAD_U)
-
-    # Mesh after partition
-    mesh_part(part_obj)
-
-    # Regenerate assembly after meshing
+    log("Stage: regenerate assembly (post-partition)")
     model.rootAssembly.regenerate()
 
-    # Apply root BC
-    apply_root_pinned_bc(model, inst, tol_y)
+    log("Stage: mesh")
+    mesh_part(part_obj, mesh_seed_scaled)
 
-    # Apply load at partition vertex (closest to hint)
-    apply_load_at_partition_vertex(model, inst, tip_y, tol_y)
+    log("Stage: regenerate assembly (post-mesh)")
+    model.rootAssembly.regenerate()
 
-    # Run job
-    make_job_and_run(model)
+    log("Stage: root BC")
+    apply_root_pinned_bc(model, inst, root_y_raw, tol_y)
 
-    log(\"===== END POST-IMPORT BLADE SCRIPT =====\")
+    log("Stage: apply load")
+    apply_concentrated_force_at_loadpoint(model, inst, load_point_scaled, FORCE_VEC)
+
+    log("Stage: run job")
+    make_job_and_run()
+
+    log("===== END POST-IMPORT BLADE SCRIPT =====")
 
 main()
 """
@@ -1467,16 +1550,11 @@ def main():
         with st.expander("Abaqus", expanded=True):
             st.markdown("**Load definition**")
             st.number_input("Load magnitude (N)", min_value=0.0, step=50.0, key="abaqus_load_mag")
-            st.slider("Force location u along TIP Curve2 TOP (0 to 1)", min_value=0.0, max_value=1.0, step=0.01, key="abaqus_u")
-            st.checkbox("Flip normal direction", key="abaqus_flip_normal")
 
-            st.info(
-                "The generated Abaqus script applies the load on **TIP Curve2 TOP** by:\n"
-                "- finding the correct tip edge using the (x,z) hint from this app,\n"
-                "- partitioning that edge by u,\n"
-                "- applying the load at the closest node to the partition vertex.\n"
-                "If any stage fails, the script stops (no fallback)."
-            )
+            # IMPORTANT: keep u away from exactly 0 or 1 to avoid partition edge issues
+            st.slider("Force location u along TIP Curve2 TOP", min_value=0.01, max_value=0.99, step=0.01, key="abaqus_u")
+
+            st.checkbox("Flip normal direction", key="abaqus_flip_normal")
 
             st.markdown("---")
             st.markdown("**Material**")
@@ -1497,12 +1575,10 @@ def main():
 
     st.title("CAE4 – Blade & Hub Parametric Tool")
 
-    # ---------- Tabs ----------
     tab_overview, tab_blade, tab_3d, tab_hub, tab_cfd, tab_abaqus = st.tabs(
         ["Overview", "Blade geometry", "3D preview", "Hub geometry", "CFD domain", "Abaqus config"]
     )
 
-    # ---------- Overview tab ----------
     with tab_overview:
         st.header("Overview")
         if config_applied:
@@ -1513,14 +1589,10 @@ def main():
 
         st.markdown(
             """
-            **Blade**
-            - Root profile: 2 cubic Bezier curves in X–Z, Curve 2 computed for C² at join and trailing edge at origin.
-            - Tip: scale + twist + translate along Y.
-
-            **Abaqus**
-            - Script is **post-import**: blade part already exists in CAE.
-            - It identifies the **TIP Curve2 TOP edge**, partitions it at **u**, meshes, applies root BC, and applies the load at the partition location.
-            - The Abaqus script prints stages to the terminal and stops immediately if any stage fails (no fallback).
+            **Abaqus script generation**
+            - This app generates an Abaqus script using your **known-good Abaqus.py template**
+            - The only changes are injected UI values (model/part names, material, thickness, mesh seed, load u, LOAD_POINT, FORCE_VEC)
+            - The script avoids `part.getBoundingBox()` so it works on older Abaqus versions.
             """
         )
 
@@ -1603,115 +1675,82 @@ def main():
     cfd_z_min = -CFD_RADIAL_CHORDS * chord_length
     cfd_z_max = +CFD_RADIAL_CHORDS * chord_length
 
-    # --- Abaqus load definition (from TIP curve2-top only) ---
+    # --- Abaqus load definition (Tip curve2-top) ---
     load_u = float(st.session_state.abaqus_u)
     load_mag = float(st.session_state.abaqus_load_mag)
     flip_normal = bool(st.session_state.abaqus_flip_normal)
 
-    # Use tip curve2-top 2D as the curve we are targeting in the Abaqus script
     pt2d, tan2d = bezier_point_and_tangent(tip_c2_top_2d, load_u)
     x_u, z_u = float(pt2d[0]), float(pt2d[1])
     dxdu, dzdu = float(tan2d[0]), float(tan2d[1])
 
-    # Build a unit normal in XZ plane from tangent
     tangent_3d = np.array([dxdu, 0.0, dzdu], dtype=float)
     normal_3d = np.array([-tangent_3d[2], 0.0, tangent_3d[0]], dtype=float)
     norm_mag = float(np.linalg.norm(normal_3d))
     normal_unit_3d = normal_3d / norm_mag if norm_mag > 0 else np.array([0.0, 0.0, 0.0])
 
-    # Force components
     if flip_normal:
         normal_unit_3d = -normal_unit_3d
 
-    fx = load_mag * float(normal_unit_3d[0])
-    fy = load_mag * float(normal_unit_3d[1])
-    fz = load_mag * float(normal_unit_3d[2])
+    force_vec = (
+        load_mag * float(normal_unit_3d[0]),
+        load_mag * float(normal_unit_3d[1]),
+        load_mag * float(normal_unit_3d[2]),
+    )
 
-    # 2D force direction in X–Z plane (unit, for arrow)
+    # load point in the blade coords (used as LOAD_POINT in the Abaqus template)
+    load_point_3d = (x_u, float(blade_length_m), z_u)
+
+    # 2D arrow direction
     dir_xz = np.array([normal_unit_3d[0], normal_unit_3d[2]], dtype=float)
     dir_xz_mag = float(np.linalg.norm(dir_xz))
     dir_xz_unit = (dir_xz / dir_xz_mag) if dir_xz_mag > 0 else np.array([0.0, 0.0])
-
     arrow_len_2d = 0.15 * chord_length if chord_length > 0 else 0.15
 
-    # Load point shown in plots (this is a "target hint", not the actual Abaqus selection coordinate)
-    load_point_3d_preview = np.array([x_u, blade_length_m, z_u], dtype=float)
-
     # =========================================================
-    # Outputs / exports
+    # Exports
     # =========================================================
-
-    root_c1_df_out = pd.DataFrame(root_c1_cubic, columns=["X (m)", "Z (m)"])
-    root_c1_df_out.insert(0, "Curve", "Root Curve 1")
-    root_c1_df_out.insert(1, "Point index", [0, 1, 2, 3])
-    root_c1_df_out.insert(2, "Y (m)", 0.0)
-
-    root_c2_df_out = pd.DataFrame(root_c2_cubic, columns=["X (m)", "Z (m)"])
-    root_c2_df_out.insert(0, "Curve", "Root Curve 2")
-    root_c2_df_out.insert(1, "Point index", [0, 1, 2, 3])
-    root_c2_df_out.insert(2, "Y (m)", 0.0)
-
-    tip_c1_df_out = pd.DataFrame(tip_c1_top_3d, columns=["X (m)", "Y (m)", "Z (m)"])
-    tip_c1_df_out.insert(0, "Curve", "Tip Curve 1")
-    tip_c1_df_out.insert(1, "Point index", [0, 1, 2, 3])
-
-    tip_c2_df_out = pd.DataFrame(tip_c2_top_3d, columns=["X (m)", "Y (m)", "Z (m)"])
-    tip_c2_df_out.insert(0, "Curve", "Tip Curve 2")
-    tip_c2_df_out.insert(1, "Point index", [0, 1, 2, 3])
-
-    hub_df_out_for_design = pd.DataFrame(hub_cp_az, columns=["X (m)", "Z (m)"])
-    hub_df_out_for_design.insert(0, "Point index", list(range(hub_cp_az.shape[0])))
 
     # Design table (single configuration)
-    design_params = {
-        "Config": ["Default"],
-        "Num_Blades": [num_blades],
-        "Blade_Length": [blade_length_m],
-        "Blade_Thickness": [blade_thickness_m],
-        "ScaleX": [scale_x],
-        "ScaleZ": [scale_z],
-        "Twist_Total_Deg": [twist_total_deg],
-        "Twist_Deg_Per_m": [twist_deg_per_m],
-        "Twist_Sign": [twist_sign],
-
-        "Join_C0_residual": [c0_res],
-        "Join_C1_residual": [c1_res],
-        "Join_C2_residual": [c2_res],
-
-        # Abaqus intent (tip curve2-top)
-        "Abaqus_Load_u": [load_u],
-        "Abaqus_LoadMag": [load_mag],
-        "LoadHint_X": [x_u],
-        "LoadHint_Z": [z_u],
-        "LoadDir_X": [float(normal_unit_3d[0])],
-        "LoadDir_Y": [float(normal_unit_3d[1])],
-        "LoadDir_Z": [float(normal_unit_3d[2])],
-        "Force_X": [float(fx)],
-        "Force_Y": [float(fy)],
-        "Force_Z": [float(fz)],
-
-        # CFD
-        "CFD_Xmin": [cfd_x_min],
-        "CFD_Xmax": [cfd_x_max],
-        "CFD_Ymin": [cfd_y_min],
-        "CFD_Ymax": [cfd_y_max],
-        "CFD_Zmin": [cfd_z_min],
-        "CFD_Zmax": [cfd_z_max],
-        "CFD_Chord": [chord_length],
-    }
-
-    dt_df = pd.DataFrame(design_params)
+    dt_df = pd.DataFrame(
+        {
+            "Config": ["Default"],
+            "Num_Blades": [num_blades],
+            "Blade_Length": [blade_length_m],
+            "Blade_Thickness": [blade_thickness_m],
+            "ScaleX": [scale_x],
+            "ScaleZ": [scale_z],
+            "Twist_Total_Deg": [twist_total_deg],
+            "Twist_Deg_Per_m": [twist_deg_per_m],
+            "Twist_Sign": [twist_sign],
+            "Join_C0_residual": [c0_res],
+            "Join_C1_residual": [c1_res],
+            "Join_C2_residual": [c2_res],
+            "Abaqus_Load_u": [load_u],
+            "Abaqus_LoadMag": [load_mag],
+            "LOAD_POINT_X": [load_point_3d[0]],
+            "LOAD_POINT_Y": [load_point_3d[1]],
+            "LOAD_POINT_Z": [load_point_3d[2]],
+            "FORCE_X": [force_vec[0]],
+            "FORCE_Y": [force_vec[1]],
+            "FORCE_Z": [force_vec[2]],
+            "CFD_Xmin": [cfd_x_min],
+            "CFD_Xmax": [cfd_x_max],
+            "CFD_Ymin": [cfd_y_min],
+            "CFD_Ymax": [cfd_y_max],
+            "CFD_Zmin": [cfd_z_min],
+            "CFD_Zmax": [cfd_z_max],
+            "CFD_Chord": [chord_length],
+        }
+    )
 
     buf_dt = BytesIO()
     with pd.ExcelWriter(buf_dt, engine="xlsxwriter") as writer:
         dt_df.to_excel(writer, sheet_name="DesignTable", index=False)
-        pd.concat([root_c1_df_out, root_c2_df_out], ignore_index=True).to_excel(writer, sheet_name="Blade_Root_CPs", index=False)
-        pd.concat([tip_c1_df_out, tip_c2_df_out], ignore_index=True).to_excel(writer, sheet_name="Blade_Tip_CPs", index=False)
-        hub_df_out_for_design.to_excel(writer, sheet_name="Hub_CPs", index=False)
         variant_table.to_excel(writer, sheet_name="BladeVariants", index=False)
     design_table_bytes = buf_dt.getvalue()
 
-    # Config template
+    # Config template (fixes the earlier bug where PartName mistakenly became "Model-1")
     template_bytes = read_template_bytes()
     if template_bytes is None:
         buf_cfg = BytesIO()
@@ -1720,55 +1759,44 @@ def main():
             pd.DataFrame({
                 "Name": [
                     "NumBlades", "ScaleX", "ScaleZ", "TwistTotalDeg", "TwistSign",
-                    "AbaqusLoadMag", "AbaqusU",
+                    "AbaqusLoadMag", "AbaqusU", "AbaqusFlipNormal",
                     "AbaqusMaterialName", "AbaqusE", "AbaqusNu", "AbaqusMeshSeed",
                     "AbaqusModelName", "AbaqusPartName", "AbaqusInstanceName", "AbaqusStepName", "AbaqusJobName",
                 ],
                 "Value": [
                     3, 0.8, 0.8, 15.0, +1,
-                    1000.0, 0.5,
-                    "BladeMaterial", 70e9, 0.33, 0.50,
-                    "Model-1", "Model-1", "Blade-1", "Step-1", "BladeJob",
+                    1000.0, 0.5, 0,
+                    "BladeMaterial", 70e9, 0.33, 0.25,
+                    "Model-1", "Blade", "Blade-1", "Step-1", "BladeJob",
                 ]
             }).to_excel(writer, sheet_name="Parameters", index=False)
-            pd.DataFrame({
-                "Section": ["Root"]*4, "Curve": [1]*4, "PointIndex": [0,1,2,3],
-                "X": [1.0, 1.0, 0.8, 0.6], "Z": [0.0, 0.06, 0.08, 0.075]
-            }).to_excel(writer, sheet_name="BezierControlPoints", index=False)
-            pd.DataFrame({
-                "PointIndex": [0,1,2,3],
-                "X": [-0.4, 0.3, 13.0, 2.0], "Z": [1.0, 1.0, 0.8, 0.0]
-            }).to_excel(writer, sheet_name="HubControlPoints", index=False)
         template_bytes = buf_cfg.getvalue()
 
-    # ---- Abaqus script generation (NEW robust method) ----
-    script_lines = generate_abaqus_post_import_script_tip_curve2_partition_u(
+    # Generate Abaqus script from YOUR template
+    script_text = generate_abaqus_script_from_your_template(
         model_name=str(st.session_state.abaqus_model_name),
         part_name=str(st.session_state.abaqus_part_name),
         instance_name=str(st.session_state.abaqus_instance_name),
         material_name=str(st.session_state.abaqus_material_name),
-        E=float(st.session_state.abaqus_E),
-        nu=float(st.session_state.abaqus_nu),
-        shell_thickness=float(blade_thickness_m),
-        mesh_seed=float(st.session_state.abaqus_mesh_seed),
         step_name=str(st.session_state.abaqus_step_name),
         job_name=str(st.session_state.abaqus_job_name),
+        E=float(st.session_state.abaqus_E),
+        nu=float(st.session_state.abaqus_nu),
+        shell_t=float(blade_thickness_m),
+        mesh_seed=float(st.session_state.abaqus_mesh_seed),
         load_u=float(load_u),
-        load_mag=float(load_mag),
-        load_point_hint_xz=(float(x_u), float(z_u)),
-        force_dir_unit_xyz=(float(normal_unit_3d[0]), float(normal_unit_3d[1]), float(normal_unit_3d[2])),
-        flip_dir=False,  # already applied above
+        load_point_xyz=load_point_3d,
+        force_vec_xyz=force_vec,
     )
-    script_bytes = script_lines.encode("utf-8")
+    script_bytes = script_text.encode("utf-8")
 
-    # Downloads expander
     with st.sidebar:
         with downloads_placeholder.container():
             with st.expander("Downloads", expanded=False):
                 st.download_button(
                     "📥 Download CATIA design table (Excel)",
                     data=design_table_bytes,
-                    file_name="blade_hub_cfd_design_table.xlsx",
+                    file_name="blade_design_table.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
                 st.download_button(
@@ -1780,25 +1808,8 @@ def main():
                 st.download_button(
                     "📥 Download Abaqus Python script (.py)",
                     data=script_bytes,
-                    file_name="abaqus_post_import_tip_curve2_partition_u.py",
+                    file_name="abaqus_post_import_from_template.py",
                     mime="text/x-python",
-                )
-                hub_csv = hub_df_out_for_design.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "Download hub control points (CSV)",
-                    data=hub_csv,
-                    file_name="hub_control_points.csv",
-                    mime="text/csv",
-                )
-                cfd_box_df = pd.DataFrame(
-                    {"Param": ["Xmin", "Xmax", "Ymin", "Ymax", "Zmin", "Zmax", "Chord"],
-                     "Value_m": [cfd_x_min, cfd_x_max, cfd_y_min, cfd_y_max, cfd_z_min, cfd_z_max, chord_length]}
-                )
-                st.download_button(
-                    "Download CFD domain parameters (CSV)",
-                    data=cfd_box_df.to_csv(index=False).encode("utf-8"),
-                    file_name="cfd_domain_parameters.csv",
-                    mime="text/csv",
                 )
                 sampled_csv = sampled_blade_points_csv(
                     root_c1_cubic, root_c2_cubic,
@@ -1813,49 +1824,9 @@ def main():
                     mime="text/csv",
                 )
 
-    # Force summary table (preview intent)
-    df_force = pd.DataFrame(
-        {
-            "Quantity": [
-                "Target hint X (from tip C2 top) (m)",
-                "Target hint Y (display only) (m)",
-                "Target hint Z (from tip C2 top) (m)",
-                "Unit direction X",
-                "Unit direction Y",
-                "Unit direction Z",
-                "Force X (N)",
-                "Force Y (N)",
-                "Force Z (N)",
-                "Force magnitude check (N)",
-            ],
-            "Value": [
-                float(load_point_3d_preview[0]),
-                float(load_point_3d_preview[1]),
-                float(load_point_3d_preview[2]),
-                float(normal_unit_3d[0]),
-                float(normal_unit_3d[1]),
-                float(normal_unit_3d[2]),
-                float(fx),
-                float(fy),
-                float(fz),
-                float(np.sqrt(fx*fx + fy*fy + fz*fz)),
-            ],
-        }
-    )
-
     # ---------- Blade geometry tab ----------
     with tab_blade:
         st.header("Blade geometry")
-
-        st.markdown(
-            f"**Effective parameters used:**  "
-            f"`Num blades` = {num_blades}, "
-            f"`Blade length` = {blade_length_m:.2f} m, "
-            f"`Thickness` = {blade_thickness_m*1000:.2f} mm, "
-            f"`ScaleX` = {scale_x:.3f}, "
-            f"`ScaleZ` = {scale_z:.3f}, "
-            f"`Twist` = {twist_total_deg:.2f}° total ({twist_deg_per_m:.4f} °/m), sign={twist_sign:+.0f}."
-        )
 
         st.subheader("Root cross-section – top surface")
         st.plotly_chart(make_root_top_plot(root_c1_cubic, root_c2_cubic), use_container_width=True)
@@ -1870,7 +1841,7 @@ def main():
             x_range=x_range, z_range=z_range,
             show_tip_c2_u_labels=True,
             force_overlay_enabled=True,
-            force_load_xz=(float(load_point_3d_preview[0]), float(load_point_3d_preview[2])),
+            force_load_xz=(float(load_point_3d[0]), float(load_point_3d[2])),
             force_dir_xz_unit=(float(dir_xz_unit[0]), float(dir_xz_unit[1])),
             force_arrow_len=float(arrow_len_2d),
         )
@@ -1879,20 +1850,17 @@ def main():
         st.subheader("Continuity check at Curve 1 → Curve 2 join (Root top)")
         st.table(pd.DataFrame({"Residual": ["C0", "C1", "C2"], "Value": [c0_res, c1_res, c2_res]}))
 
-        st.subheader("Abaqus load intent (preview)")
-        st.table(df_force)
-
-        st.subheader("Control points for manufacturing – Blade")
-        st.markdown("**Root – cubic control points (top half, Y = 0)**")
-        st.dataframe(pd.concat([root_c1_df_out, root_c2_df_out], ignore_index=True))
-        st.markdown("**Tip – cubic control points (top half, Y = Blade length)**")
-        st.dataframe(pd.concat([tip_c1_df_out, tip_c2_df_out], ignore_index=True))
+        st.subheader("Abaqus load values that will be injected")
+        st.table(pd.DataFrame({
+            "Name": ["LOAD_U", "LOAD_POINT (x,y,z)", "FORCE_VEC (Fx,Fy,Fz)"],
+            "Value": [load_u, str(load_point_3d), str(force_vec)]
+        }))
 
     # ---------- 3D preview tab ----------
     with tab_3d:
         st.header("3D preview – Blade")
         fig3d = make_blade_3d_plot(root_c1_cubic, root_c2_cubic, tip_c1_top_2d, tip_c2_top_2d, blade_length_m)
-        fig3d = add_force_to_3d_fig(fig3d, load_point_3d_preview, normal_unit_3d, chord_length, label="Force direction (preview)")
+        fig3d = add_force_to_3d_fig(fig3d, np.array(load_point_3d), normal_unit_3d, chord_length, label="Force direction (preview)")
         st.plotly_chart(fig3d, use_container_width=True)
 
     # ---------- Hub geometry tab ----------
@@ -1900,8 +1868,6 @@ def main():
         st.header("Hub geometry")
         st.markdown(f"Hub profile control points source: **{hub_source_label}**")
         st.plotly_chart(make_hub_plot(hub_cp_az, hub_plane_label=hub_plane_label), use_container_width=True)
-        st.markdown("**Hub control points**")
-        st.dataframe(hub_df_out_for_design)
 
     # ---------- CFD domain tab ----------
     with tab_cfd:
@@ -1926,9 +1892,8 @@ def main():
 
     # ---------- Abaqus config tab ----------
     with tab_abaqus:
-        st.header("Abaqus configuration helpers")
-        st.subheader("Abaqus script preview (post-import, tip curve2 partition-by-u)")
-        st.code(script_lines, language="python")
+        st.header("Abaqus script preview (generated from your template)")
+        st.code(script_text, language="python")
 
 
 if __name__ == "__main__":

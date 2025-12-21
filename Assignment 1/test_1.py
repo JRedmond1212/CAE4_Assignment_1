@@ -1,17 +1,24 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
 from io import BytesIO
 import plotly.graph_objects as go
 import os
 import hashlib
+import openpyxl
 from typing import Tuple, List, Optional
 
 # =========================================================
-# Constants and colours
+# Files / constants
 # =========================================================
 
-TEMPLATE_FILENAME = "blade_bezier_assignment_template.xlsx"
+# This should be the Excel you attached (used as the OUTPUT format template)
+DESIGN_TABLE_TEMPLATE_PATH = "/mnt/data/blade_hub_cfd_design_table (1).xlsx"
+DESIGN_TABLE_SHEET_NAME = "DesignTable"
+
+# Config template filename (download)
+CONFIG_TEMPLATE_FILENAME = "config_template.xlsx"
 
 COLOR_ROOT_C1 = "#1f77b4"   # blue
 COLOR_ROOT_C2 = "#d62728"   # red
@@ -19,110 +26,101 @@ COLOR_TIP_C1  = "#2ca02c"   # green
 COLOR_TIP_C2  = "#ff7f0e"   # orange
 COLOR_HUB     = "#9467bd"   # purple
 
-# CFD domain factors (chord-based extents).
-CFD_X_UPSTREAM_CHORDS   = 30.0
-CFD_X_DOWNSTREAM_CHORDS = 120.0
-CFD_RADIAL_CHORDS       = 30.0
+# =========================================================
+# UX: keep scroll position on rerun
+# =========================================================
 
-# Sampling resolution for optional “export sampled points”
-SAMPLED_POINTS_PER_CURVE = 201
-
+def keep_scroll_position():
+    # Saves scroll position before rerun, restores it after rerun.
+    # This prevents the “jump to top” annoyance when inputs change.
+    components.html(
+        """
+        <script>
+        (function() {
+          const key = "st_scrollY";
+          function saveScroll() {
+            try { sessionStorage.setItem(key, String(window.scrollY || 0)); } catch(e) {}
+          }
+          function restoreScroll() {
+            try {
+              const y = parseInt(sessionStorage.getItem(key) || "0", 10);
+              if (!isNaN(y)) window.scrollTo(0, y);
+            } catch(e) {}
+          }
+          window.addEventListener("beforeunload", saveScroll);
+          window.addEventListener("scroll", function(){ saveScroll(); }, {passive:true});
+          setTimeout(restoreScroll, 50);
+        })();
+        </script>
+        """,
+        height=0,
+    )
 
 # =========================================================
 # Maths helpers
 # =========================================================
 
 def binomial_coeff(n, k):
-    """Binomial coefficient C(n,k)."""
     from math import comb
     return comb(n, k)
 
-
 def general_bezier_curve(control_points, num_points=201):
-    """
-    Evaluate an (n-1)-degree Bezier curve given N control points [[a,b], ...].
-    Returns u, a, b arrays.
-    """
     cp = np.asarray(control_points, dtype=float)
     if cp.ndim != 2 or cp.shape[1] != 2:
-        raise ValueError("control_points must be an array of shape (N, 2).")
-
+        raise ValueError("control_points must be (N,2) array.")
     n = cp.shape[0]
     degree = n - 1
     if degree < 1:
-        raise ValueError("Need at least 2 control points to define a Bezier curve.")
-
+        raise ValueError("Need >=2 control points.")
     u = np.linspace(0.0, 1.0, num_points)
-
     B = np.zeros((n, len(u)))
     for i in range(n):
         coeff = binomial_coeff(degree, i)
         B[i, :] = coeff * (u ** i) * ((1 - u) ** (degree - i))
-
     a = np.dot(cp[:, 0], B)
     b = np.dot(cp[:, 1], B)
-
     return u, a, b
 
-
 def bezier_point_and_tangent(control_points, u):
-    """
-    For a general (n-1)-degree Bezier curve with control_points [[x,z], ...],
-    compute the point and tangent vector at scalar u in [0,1].
-
-    Returns:
-      point_2d = [x(u), z(u)]
-      tangent_2d = [dx/du, dz/du]  (not normalised)
-    """
     cp = np.asarray(control_points, dtype=float)
     if cp.ndim != 2 or cp.shape[1] != 2:
-        raise ValueError("control_points must be an array of shape (N, 2).")
-
+        raise ValueError("control_points must be (N,2) array.")
     n = cp.shape[0]
     degree = n - 1
     if degree < 1:
-        raise ValueError("Need at least 2 control points to define a Bezier curve.")
-
-    # Position basis
+        raise ValueError("Need >=2 control points.")
+    # position
     B = np.zeros(n)
     for i in range(n):
         coeff = binomial_coeff(degree, i)
         B[i] = coeff * (u ** i) * ((1 - u) ** (degree - i))
-    point = np.dot(cp.T, B)  # (2,)
-
-    # Derivative basis
-    cp_diff = degree * (cp[1:, :] - cp[:-1, :])  # (n-1, 2)
+    point = np.dot(cp.T, B)
+    # derivative
+    cp_diff = degree * (cp[1:, :] - cp[:-1, :])
     Bp = np.zeros(degree)
     for j in range(degree):
         coeff = binomial_coeff(degree - 1, j)
         Bp[j] = coeff * (u ** j) * ((1 - u) ** (degree - 1 - j))
-    tangent = np.dot(cp_diff.T, Bp)  # (2,)
-
+    tangent = np.dot(cp_diff.T, Bp)
     return point, tangent
 
+def compute_curve2_cubic_c2(root_c1_cubic, trailing_edge=(0.0, 0.0)):
+    P1 = root_c1_cubic[1, :]
+    P2 = root_c1_cubic[2, :]
+    P3 = root_c1_cubic[3, :]
+    Q0 = P3
+    Q1 = 2.0 * P3 - P2
+    Q2 = 4.0 * P3 - 4.0 * P2 + P1
+    Q3 = np.array(trailing_edge, dtype=float)
+    return np.vstack([Q0, Q1, Q2, Q3])
 
 def transform_tip_from_root(cp_root, scale_x, scale_z, twist_deg_per_m, blade_length, twist_sign=+1.0):
-    """
-    Tip section from root:
-      1) Scale in X and Z about the leading-edge position (max X)
-      2) Rotate due to twist about the same position
-      3) Translate along Y by blade length
-
-    Coordinates:
-      X = chord-wise
-      Y = span-wise
-      Z = thickness
-    """
     cp_root = np.asarray(cp_root, dtype=float)
-
-    # Leading edge pivot: maximum X coordinate
     x_le = np.max(cp_root[:, 0])
     z_le = 0.0
-
     x_rel = cp_root[:, 0] - x_le
     z_rel = cp_root[:, 1] - z_le
 
-    # Scale
     x_scaled = scale_x * x_rel
     z_scaled = scale_z * z_rel
 
@@ -131,7 +129,7 @@ def transform_tip_from_root(cp_root, scale_x, scale_z, twist_deg_per_m, blade_le
     cos_t = np.cos(theta)
     sin_t = np.sin(theta)
 
-    # Rotate about Y axis
+    # rotate about Y
     x_rot = cos_t * x_scaled + sin_t * z_scaled
     z_rot = -sin_t * x_scaled + cos_t * z_scaled
 
@@ -143,9 +141,8 @@ def transform_tip_from_root(cp_root, scale_x, scale_z, twist_deg_per_m, blade_le
     cp_tip_3d = np.column_stack([x_tip, y_tip, z_tip])
     return cp_tip_2d, cp_tip_3d
 
-
 # =========================================================
-# Blade variant table logic (dynamic, no hard-coded restriction)
+# Variant table logic (unchanged)
 # =========================================================
 
 def default_variant_table() -> pd.DataFrame:
@@ -157,14 +154,7 @@ def default_variant_table() -> pd.DataFrame:
         }
     )
 
-
 def parse_variant_table_from_excel(xls: pd.ExcelFile) -> Optional[pd.DataFrame]:
-    """
-    Try hard to find a blade variant table in the uploaded config.
-    Accepts:
-      - A sheet named 'Table1' or containing 'variant' or 'blade' and 'table'
-      - Or ANY sheet containing columns that look like NumBlades + (Length/Thickness)
-    """
     candidate_sheets = []
     for s in xls.sheet_names:
         name = s.lower()
@@ -205,7 +195,6 @@ def parse_variant_table_from_excel(xls: pd.ExcelFile) -> Optional[pd.DataFrame]:
                 return out.reset_index(drop=True)
     return None
 
-
 def blade_length_and_thickness_from_table(num_blades: int, table: pd.DataFrame) -> Tuple[float, float]:
     sub = table[table["NumBlades"] == int(num_blades)]
     if sub.empty:
@@ -214,21 +203,15 @@ def blade_length_and_thickness_from_table(num_blades: int, table: pd.DataFrame) 
     r = sub.iloc[0]
     return float(r["BladeLength_m"]), float(r["Thickness_m"])
 
-
 # =========================================================
-# Excel helpers
+# Excel / config helpers
 # =========================================================
 
-def read_template_bytes():
-    if not os.path.exists(TEMPLATE_FILENAME):
-        return None
-    with open(TEMPLATE_FILENAME, "rb") as f:
-        return f.read()
-
+def file_hash_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
 
 def sort_curve_points(df_curve):
     df_curve = df_curve.copy()
-
     if "PointIndex" in df_curve.columns:
         df_curve = df_curve.sort_values("PointIndex")
     elif "Point" in df_curve.columns:
@@ -241,38 +224,29 @@ def sort_curve_points(df_curve):
             except Exception:
                 pass
             return 999999
-
         df_curve["__idx__"] = df_curve["Point"].apply(extract_index)
         df_curve = df_curve.sort_values("__idx__").drop(columns="__idx__")
-
     return df_curve
-
 
 def load_bezier_control_points(excel_file_like):
     try:
         xls = pd.ExcelFile(excel_file_like)
     except Exception:
         return None
-
     if "BezierControlPoints" not in xls.sheet_names:
         return None
-
     return pd.read_excel(xls, sheet_name="BezierControlPoints")
-
 
 def load_parameters(excel_file_like):
     try:
         xls = pd.ExcelFile(excel_file_like)
     except Exception:
         return {}
-
     if "Parameters" not in xls.sheet_names:
         return {}
-
     df = pd.read_excel(xls, sheet_name="Parameters")
     if "Name" not in df.columns or "Value" not in df.columns:
         return {}
-
     params = {}
     for _, row in df.iterrows():
         name = row["Name"]
@@ -282,23 +256,13 @@ def load_parameters(excel_file_like):
         params[str(name)] = value
     return params
 
-
 def load_hub_control_points(excel_file_like):
-    """
-    Optional HubControlPoints sheet.
-
-    Supports BOTH:
-      - Columns: X, Z   (preferred)
-      - Columns: Y, Z   (legacy fallback)
-    """
     try:
         xls = pd.ExcelFile(excel_file_like)
     except Exception:
         return None, None
-
     if "HubControlPoints" not in xls.sheet_names:
         return None, None
-
     df = pd.read_excel(xls, sheet_name="HubControlPoints")
 
     used = None
@@ -317,476 +281,18 @@ def load_hub_control_points(excel_file_like):
 
     if np.isnan(A).any() or np.isnan(B).any():
         return None, None
-
     cp = np.column_stack([A, B])
     if cp.shape[0] < 2:
         return None, None
-
     return cp, used
 
-
-def file_hash_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
-
-
 # =========================================================
-# C² continuity for Curve 2 (cubic Bezier)
-# =========================================================
-
-def compute_curve2_cubic_c2(root_c1_cubic, trailing_edge=(0.0, 0.0)):
-    """
-    Enforce C² at join between two cubics:
-      Q0 = P3
-      Q1 = 2*P3 - P2
-      Q2 = 4*P3 - 4*P2 + P1
-      Q3 = trailing_edge
-    """
-    P1 = root_c1_cubic[1, :]
-    P2 = root_c1_cubic[2, :]
-    P3 = root_c1_cubic[3, :]
-
-    Q0 = P3
-    Q1 = 2.0 * P3 - P2
-    Q2 = 4.0 * P3 - 4.0 * P2 + P1
-    Q3 = np.array(trailing_edge, dtype=float)
-
-    return np.vstack([Q0, Q1, Q2, Q3])
-
-
-def continuity_residuals_cubic(P, Q):
-    """
-    Return numeric residuals at the join:
-      - C0: |P3 - Q0|
-      - C1: |P'(1) - Q'(0)|
-      - C2: |P''(1) - Q''(0)|
-    """
-    P0, P1, P2, P3 = P
-    Q0, Q1, Q2, Q3 = Q
-
-    c0 = np.linalg.norm(P3 - Q0)
-
-    dP = 3.0 * (P3 - P2)
-    dQ = 3.0 * (Q1 - Q0)
-    c1 = np.linalg.norm(dP - dQ)
-
-    ddP = 6.0 * (P3 - 2.0 * P2 + P1)
-    ddQ = 6.0 * (Q2 - 2.0 * Q1 + Q0)
-    c2 = np.linalg.norm(ddP - ddQ)
-
-    return c0, c1, c2
-
-
-# =========================================================
-# Plotting helpers
-# =========================================================
-
-def apply_common_layout_tweaks(fig, title, x_range=None, z_range=None, x_label="x", z_label="z"):
-    fig.update_layout(
-        title=title,
-        xaxis_title=f"{x_label}",
-        yaxis_title=f"{z_label}",
-        legend_title_text="",
-        width=None,
-        height=550,
-        margin=dict(l=40, r=20, t=60, b=130),
-        legend=dict(
-            orientation="h",
-            yanchor="top",
-            y=-0.28,
-            xanchor="center",
-            x=0.5,
-            traceorder="normal",
-        ),
-    )
-    fig.update_yaxes(scaleanchor="x", scaleratio=1)
-    fig.update_yaxes(zeroline=True, zerolinewidth=2)
-    fig.add_hline(y=0, line_width=1, line_dash="dash", opacity=0.5)
-
-    if x_range is not None:
-        fig.update_xaxes(range=x_range)
-    if z_range is not None:
-        fig.update_yaxes(range=z_range)
-
-    return fig
-
-
-def compute_axis_ranges(root_c1, root_c2, tip_c1_top_2d, tip_c2_top_2d, tip_c1_bottom_2d, tip_c2_bottom_2d):
-    x_list = [root_c1[:, 0], root_c2[:, 0]]
-    z_list = [root_c1[:, 1], root_c2[:, 1]]
-
-    if tip_c1_top_2d is not None:
-        x_list.append(tip_c1_top_2d[:, 0])
-        z_list.append(tip_c1_top_2d[:, 1])
-    if tip_c2_top_2d is not None:
-        x_list.append(tip_c2_top_2d[:, 0])
-        z_list.append(tip_c2_top_2d[:, 1])
-    if tip_c1_bottom_2d is not None:
-        x_list.append(tip_c1_bottom_2d[:, 0])
-        z_list.append(tip_c1_bottom_2d[:, 1])
-    if tip_c2_bottom_2d is not None:
-        x_list.append(tip_c2_bottom_2d[:, 0])
-        z_list.append(tip_c2_bottom_2d[:, 1])
-
-    x_all = np.concatenate(x_list)
-    z_all = np.concatenate(z_list)
-
-    x_min, x_max = np.min(x_all), np.max(x_all)
-    z_min, z_max = np.min(z_all), np.max(z_all)
-
-    dx = x_max - x_min
-    dz = z_max - z_min
-    if dx == 0:
-        dx = 1.0
-    if dz == 0:
-        dz = 1.0
-
-    margin_x = 0.05 * dx
-    margin_z = 0.05 * dz
-
-    x_range = [x_min - margin_x, x_max + margin_x]
-    z_range = [z_min - margin_z, z_max + margin_z]
-
-    return x_range, z_range
-
-
-def make_root_top_plot(root_c1, root_c2):
-    u1, x1, z1_top = general_bezier_curve(root_c1)
-    u2, x2, z2_top = general_bezier_curve(root_c2)
-
-    fig = go.Figure()
-
-    fig.add_trace(go.Scatter(
-        x=x1, y=z1_top, mode="lines",
-        name="Root Curve 1 (top)",
-        line=dict(color=COLOR_ROOT_C1),
-        customdata=np.column_stack([u1]),
-        hovertemplate=(
-            "Root Curve 1 top<br>u = %{customdata[0]:.3f}<br>"
-            "x = %{x:.4f}<br>z = %{y:.4f}<extra></extra>"
-        ),
-    ))
-
-    fig.add_trace(go.Scatter(
-        x=x2, y=z2_top, mode="lines",
-        name="Root Curve 2 (top)",
-        line=dict(color=COLOR_ROOT_C2),
-        customdata=np.column_stack([u2]),
-        hovertemplate=(
-            "Root Curve 2 top<br>u = %{customdata[0]:.3f}<br>"
-            "x = %{x:.4f}<br>z = %{y:.4f}<extra></extra>"
-        ),
-    ))
-
-    fig.add_trace(go.Scatter(
-        x=root_c1[:, 0], y=root_c1[:, 1], mode="lines+markers",
-        line=dict(dash="dot", color=COLOR_ROOT_C1),
-        marker=dict(color=COLOR_ROOT_C1),
-        name="Root Curve 1 CPs",
-        hovertemplate="Root C1 CP<br>x=%{x:.4f}<br>z=%{y:.4f}<extra></extra>",
-    ))
-
-    fig.add_trace(go.Scatter(
-        x=root_c2[:, 0], y=root_c2[:, 1], mode="lines+markers",
-        line=dict(dash="dot", color=COLOR_ROOT_C2),
-        marker=dict(color=COLOR_ROOT_C2),
-        name="Root Curve 2 CPs",
-        hovertemplate="Root C2 CP<br>x=%{x:.4f}<br>z=%{y:.4f}<extra></extra>",
-    ))
-
-    return apply_common_layout_tweaks(
-        fig,
-        "Root Blade Top Profile (two cubic Bezier curves, C² at join)",
-        x_label="x (chord-wise)",
-        z_label="z (thickness direction)",
-    )
-
-
-def _add_tip_c2_u_labels(fig, tip_c2_top_2d):
-    u_vals = np.array([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0], dtype=float)
-    xs, zs, texts = [], [], []
-    for u in u_vals:
-        pt, _ = bezier_point_and_tangent(tip_c2_top_2d, float(u))
-        xs.append(float(pt[0]))
-        zs.append(float(pt[1]))
-        texts.append(f"u={u:.1f}")
-
-    fig.add_trace(go.Scatter(
-        x=xs, y=zs,
-        mode="markers+text",
-        name="Tip C2 u-ratio",
-        text=texts,
-        textposition="top center",
-        marker=dict(size=6, color=COLOR_TIP_C2),
-        hovertemplate="Tip C2 label<br>%{text}<br>x=%{x:.4f}<br>z=%{y:.4f}<extra></extra>",
-        showlegend=True,
-    ))
-
-
-def _add_force_arrow_2d(fig, load_xz, dir_xz_unit, arrow_len):
-    x0, z0 = float(load_xz[0]), float(load_xz[1])
-    dx, dz = float(dir_xz_unit[0]), float(dir_xz_unit[1])
-
-    x1 = x0 + arrow_len * dx
-    z1 = z0 + arrow_len * dz
-
-    fig.add_trace(go.Scatter(
-        x=[x0, x1],
-        y=[z0, z1],
-        mode="lines+markers",
-        name="Applied force (proj. X–Z)",
-        line=dict(width=4),
-        marker=dict(size=6),
-        hovertemplate="Force arrow (XZ)<br>x=%{x:.4f}<br>z=%{y:.4f}<extra></extra>",
-        showlegend=True,
-    ))
-
-    fig.add_trace(go.Scatter(
-        x=[x0], y=[z0],
-        mode="markers",
-        name="Load point (XZ)",
-        marker=dict(size=10, symbol="x"),
-        hovertemplate="Load point (XZ)<br>x=%{x:.4f}<br>z=%{y:.4f}<extra></extra>",
-        showlegend=True,
-    ))
-
-
-def make_root_and_tip_plot(
-    root_c1, root_c2,
-    tip_c1_top_2d, tip_c2_top_2d,
-    tip_c1_bottom_2d, tip_c2_bottom_2d,
-    show_root, show_tip,
-    x_range, z_range,
-    show_tip_c2_u_labels: bool = True,
-    force_overlay_enabled: bool = False,
-    force_load_xz: Optional[Tuple[float, float]] = None,
-    force_dir_xz_unit: Optional[Tuple[float, float]] = None,
-    force_arrow_len: float = 0.0,
-):
-    fig = go.Figure()
-
-    if show_root:
-        u1, x1, z1_top = general_bezier_curve(root_c1)
-        u2, x2, z2_top = general_bezier_curve(root_c2)
-
-        z1_bottom = -z1_top
-        z2_bottom = -z2_top
-
-        fig.add_trace(go.Scatter(
-            x=x1, y=z1_top, mode="lines", name="Root C1 top",
-            line=dict(color=COLOR_ROOT_C1),
-            customdata=np.column_stack([u1]),
-            hovertemplate="Root C1 top<br>u=%{customdata[0]:.3f}<br>x=%{x:.4f}<br>z=%{y:.4f}<extra></extra>",
-        ))
-        fig.add_trace(go.Scatter(
-            x=x2, y=z2_top, mode="lines", name="Root C2 top",
-            line=dict(color=COLOR_ROOT_C2),
-            customdata=np.column_stack([u2]),
-            hovertemplate="Root C2 top<br>u=%{customdata[0]:.3f}<br>x=%{x:.4f}<br>z=%{y:.4f}<extra></extra>",
-        ))
-        fig.add_trace(go.Scatter(
-            x=x1, y=z1_bottom, mode="lines", name="Root C1 bottom",
-            line=dict(color=COLOR_ROOT_C1),
-            customdata=np.column_stack([u1]),
-            hovertemplate="Root C1 bottom<br>u=%{customdata[0]:.3f}<br>x=%{x:.4f}<br>z=%{y:.4f} (mirrored)<extra></extra>",
-        ))
-        fig.add_trace(go.Scatter(
-            x=x2, y=z2_bottom, mode="lines", name="Root C2 bottom",
-            line=dict(color=COLOR_ROOT_C2),
-            customdata=np.column_stack([u2]),
-            hovertemplate="Root C2 bottom<br>u=%{customdata[0]:.3f}<br>x=%{x:.4f}<br>z=%{y:.4f} (mirrored)<extra></extra>",
-        ))
-
-    if show_tip:
-        u1t, x1t, z1t = general_bezier_curve(tip_c1_top_2d)
-        u2t, x2t, z2t = general_bezier_curve(tip_c2_top_2d)
-        u1b, x1b, z1b = general_bezier_curve(tip_c1_bottom_2d)
-        u2b, x2b, z2b = general_bezier_curve(tip_c2_bottom_2d)
-
-        fig.add_trace(go.Scatter(
-            x=x1t, y=z1t, mode="lines", name="Tip C1 top",
-            line=dict(dash="dash", color=COLOR_TIP_C1),
-            customdata=np.column_stack([u1t]),
-            hovertemplate="Tip C1 top<br>u=%{customdata[0]:.3f}<br>x=%{x:.4f}<br>z=%{y:.4f}<extra></extra>",
-        ))
-        fig.add_trace(go.Scatter(
-            x=x2t, y=z2t, mode="lines", name="Tip C2 top",
-            line=dict(dash="dash", color=COLOR_TIP_C2),
-            customdata=np.column_stack([u2t]),
-            hovertemplate="Tip C2 top<br>u=%{customdata[0]:.3f}<br>x=%{x:.4f}<br>z=%{y:.4f}<extra></extra>",
-        ))
-        fig.add_trace(go.Scatter(
-            x=x1b, y=z1b, mode="lines", name="Tip C1 bottom",
-            line=dict(dash="dash", color=COLOR_TIP_C1),
-            customdata=np.column_stack([u1b]),
-            hovertemplate="Tip C1 bottom<br>u=%{customdata[0]:.3f}<br>x=%{x:.4f}<br>z=%{y:.4f} (mirrored)<extra></extra>",
-        ))
-        fig.add_trace(go.Scatter(
-            x=x2b, y=z2b, mode="lines", name="Tip C2 bottom",
-            line=dict(dash="dash", color=COLOR_TIP_C2),
-            customdata=np.column_stack([u2b]),
-            hovertemplate="Tip C2 bottom<br>u=%{customdata[0]:.3f}<br>x=%{x:.4f}<br>z=%{y:.4f} (mirrored)<extra></extra>",
-        ))
-
-        if show_tip_c2_u_labels and tip_c2_top_2d is not None:
-            _add_tip_c2_u_labels(fig, tip_c2_top_2d)
-
-    if force_overlay_enabled and force_load_xz is not None and force_dir_xz_unit is not None and force_arrow_len > 0:
-        _add_force_arrow_2d(fig, force_load_xz, force_dir_xz_unit, force_arrow_len)
-
-    return apply_common_layout_tweaks(
-        fig,
-        "Blade Outer Profile (Root & Tip, mirrored about X-axis)",
-        x_range=x_range,
-        z_range=z_range,
-        x_label="x (chord-wise)",
-        z_label="z (thickness direction)",
-    )
-
-
-def make_hub_plot(hub_cp_az, hub_plane_label="X–Z"):
-    u, a_vals, z_vals = general_bezier_curve(hub_cp_az)
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=a_vals, y=z_vals, mode="lines",
-        name="Hub profile",
-        line=dict(color=COLOR_HUB),
-        customdata=np.column_stack([u]),
-        hovertemplate=(
-            f"Hub profile ({hub_plane_label})<br>u=%{{customdata[0]:.3f}}<br>"
-            f"{hub_plane_label.split('–')[0]}=%{{x:.4f}}<br>Z=%{{y:.4f}}<extra></extra>"
-        ),
-    ))
-    fig.add_trace(go.Scatter(
-        x=hub_cp_az[:, 0], y=hub_cp_az[:, 1],
-        mode="lines+markers",
-        name="Hub CPs",
-        line=dict(dash="dot", color=COLOR_HUB),
-        marker=dict(color=COLOR_HUB),
-        hovertemplate=(
-            f"Hub CP<br>{hub_plane_label.split('–')[0]}=%{{x:.4f}}<br>Z=%{{y:.4f}}<extra></extra>"
-        ),
-    ))
-
-    xlab = f"{hub_plane_label.split('–')[0]} (hub plane)"
-    return apply_common_layout_tweaks(fig, f"Hub external profile (Bezier curve in {hub_plane_label})",
-                                     x_label=xlab, z_label="Z")
-
-
-def make_blade_3d_plot(root_c1, root_c2, tip_c1_top_2d, tip_c2_top_2d, blade_length_m):
-    fig = go.Figure()
-
-    # Root (y=0)
-    _, x1r, z1r_top = general_bezier_curve(root_c1)
-    _, x2r, z2r_top = general_bezier_curve(root_c2)
-    fig.add_trace(go.Scatter3d(x=x1r, y=np.zeros_like(x1r), z=z1r_top, mode="lines",
-                               name="Root C1 top", line=dict(color=COLOR_ROOT_C1)))
-    fig.add_trace(go.Scatter3d(x=x2r, y=np.zeros_like(x2r), z=z2r_top, mode="lines",
-                               name="Root C2 top", line=dict(color=COLOR_ROOT_C2)))
-    fig.add_trace(go.Scatter3d(x=x1r, y=np.zeros_like(x1r), z=-z1r_top, mode="lines",
-                               name="Root C1 bottom", line=dict(color=COLOR_ROOT_C1)))
-    fig.add_trace(go.Scatter3d(x=x2r, y=np.zeros_like(x2r), z=-z2r_top, mode="lines",
-                               name="Root C2 bottom", line=dict(color=COLOR_ROOT_C2)))
-
-    # Tip (y=L)
-    _, x1t, z1t_top = general_bezier_curve(tip_c1_top_2d)
-    _, x2t, z2t_top = general_bezier_curve(tip_c2_top_2d)
-    fig.add_trace(go.Scatter3d(x=x1t, y=np.ones_like(x1t) * blade_length_m, z=z1t_top, mode="lines",
-                               name="Tip C1 top", line=dict(color=COLOR_TIP_C1)))
-    fig.add_trace(go.Scatter3d(x=x2t, y=np.ones_like(x2t) * blade_length_m, z=z2t_top, mode="lines",
-                               name="Tip C2 top", line=dict(color=COLOR_TIP_C2)))
-    fig.add_trace(go.Scatter3d(x=x1t, y=np.ones_like(x1t) * blade_length_m, z=-z1t_top, mode="lines",
-                               name="Tip C1 bottom", line=dict(color=COLOR_TIP_C1)))
-    fig.add_trace(go.Scatter3d(x=x2t, y=np.ones_like(x2t) * blade_length_m, z=-z2t_top, mode="lines",
-                               name="Tip C2 bottom", line=dict(color=COLOR_TIP_C2)))
-
-    fig.update_layout(
-        title="3D preview – Blade root & tip (top and bottom surfaces)",
-        scene=dict(
-            xaxis_title="X (chord-wise)",
-            yaxis_title="Y (span-wise)",
-            zaxis_title="Z (thickness)",
-            aspectmode="data",
-        ),
-        margin=dict(l=0, r=0, t=40, b=0),
-        legend=dict(orientation="h", yanchor="top", y=0.02, xanchor="center", x=0.5),
-    )
-    return fig
-
-
-def add_force_to_3d_fig(fig, load_point_3d, force_dir_unit_3d, chord_length, label="Applied force"):
-    p = np.asarray(load_point_3d, dtype=float)
-    d = np.asarray(force_dir_unit_3d, dtype=float)
-    dmag = float(np.linalg.norm(d))
-    if dmag <= 0:
-        return fig
-
-    d = d / dmag
-    arrow_len = 0.25 * float(chord_length) if chord_length > 0 else 0.25
-    p2 = p + arrow_len * d
-
-    fig.add_trace(go.Scatter3d(
-        x=[p[0]], y=[p[1]], z=[p[2]],
-        mode="markers",
-        name="Load point (target)",
-        marker=dict(size=6, symbol="x"),
-        hovertemplate="Load point<br>x=%{x:.4f}<br>y=%{y:.4f}<br>z=%{z:.4f}<extra></extra>",
-    ))
-    fig.add_trace(go.Scatter3d(
-        x=[p[0], p2[0]],
-        y=[p[1], p2[1]],
-        z=[p[2], p2[2]],
-        mode="lines+markers",
-        name=label,
-        line=dict(width=6),
-        marker=dict(size=3),
-        hovertemplate="Force arrow<br>x=%{x:.4f}<br>y=%{y:.4f}<br>z=%{z:.4f}<extra></extra>",
-    ))
-    return fig
-
-
-# =========================================================
-# Export helpers (sampled points)
-# =========================================================
-
-def sampled_blade_points_csv(root_c1, root_c2, tip_c1_top_2d, tip_c2_top_2d, tip_c1_bot_2d, tip_c2_bot_2d, blade_length_m):
-    rows = []
-
-    def add_curve(section, surface, curve_name, y_val, cp_2d):
-        u, x, z = general_bezier_curve(cp_2d, num_points=SAMPLED_POINTS_PER_CURVE)
-        for ui, xi, zi in zip(u, x, z):
-            rows.append({
-                "Section": section,
-                "Surface": surface,
-                "Curve": curve_name,
-                "u": float(ui),
-                "X": float(xi),
-                "Y": float(y_val),
-                "Z": float(zi),
-            })
-
-    add_curve("Root", "Top", "C1", 0.0, root_c1)
-    add_curve("Root", "Top", "C2", 0.0, root_c2)
-    add_curve("Root", "Bottom", "C1", 0.0, root_c1 * np.array([1.0, -1.0]))
-    add_curve("Root", "Bottom", "C2", 0.0, root_c2 * np.array([1.0, -1.0]))
-
-    add_curve("Tip", "Top", "C1", blade_length_m, tip_c1_top_2d)
-    add_curve("Tip", "Top", "C2", blade_length_m, tip_c2_top_2d)
-    add_curve("Tip", "Bottom", "C1", blade_length_m, tip_c1_bot_2d)
-    add_curve("Tip", "Bottom", "C2", blade_length_m, tip_c2_bot_2d)
-
-    df = pd.DataFrame(rows)
-    return df.to_csv(index=False).encode("utf-8")
-
-
-# =========================================================
-# Config behaviour: apply uploaded config ONCE per file change
+# Streamlit state defaults
 # =========================================================
 
 def ensure_state_defaults():
     if "defaults_initialised" in st.session_state:
         return
-
     st.session_state.defaults_initialised = True
 
     # Blade defaults
@@ -797,6 +303,7 @@ def ensure_state_defaults():
     st.session_state.twist_total_deg = 15.0
     st.session_state.twist_sign = +1.0
 
+    # Root Curve 1 CPs
     st.session_state.c1_p0_x = 1.0
     st.session_state.c1_p0_z = 0.0
     st.session_state.c1_p1_x = 1.0
@@ -806,38 +313,33 @@ def ensure_state_defaults():
     st.session_state.c1_p3_x = 0.6
     st.session_state.c1_p3_z = 0.0750
 
-    # Hub defaults (X–Z)
+    # Hub CP defaults (X–Z)
     st.session_state.hub_p0_x = -0.4
     st.session_state.hub_p0_z = 1.0
     st.session_state.hub_p1_x = 0.3
     st.session_state.hub_p1_z = 1.0
-    st.session_state.hub_p2_x = 13.0
+    st.session_state.hub_p2_x = 1.3
     st.session_state.hub_p2_z = 0.8
     st.session_state.hub_p3_x = 2.0
     st.session_state.hub_p3_z = 0.0
 
-    # Plot visibility
-    st.session_state.show_root = True
-    st.session_state.show_tip = True
-
-    # Abaqus defaults
-    st.session_state.abaqus_load_mag = 1000.0
-    st.session_state.abaqus_u = 0.50
-    st.session_state.abaqus_flip_normal = False
-
-    # Abaqus model database defaults
-    st.session_state.abaqus_model_name = "Model-1"
-    st.session_state.abaqus_part_name = "Blade"
-    st.session_state.abaqus_instance_name = "Blade-1"
-    st.session_state.abaqus_material_name = "BladeMaterial"
-    st.session_state.abaqus_E = 70e9
-    st.session_state.abaqus_nu = 0.33
-    st.session_state.abaqus_mesh_seed = 0.25
+    # Abaqus defaults (UI units)
+    st.session_state.abaqus_load_mag_kN = 1.0    # kN
+    st.session_state.abaqus_u = 0.50            # 0..1
+    st.session_state.abaqus_part_name = "Blade" # imported part name in CAE
     st.session_state.abaqus_job_name = "BladeJob"
-    st.session_state.abaqus_step_name = "Step-1"
+    st.session_state.abaqus_script_filename = "Blade_abaqus_code.py"
 
+    # Material (UI units)
+    st.session_state.abaqus_material_name = "Fibreglass"
+    st.session_state.abaqus_E_MPa = 70000.0     # 70 GPa
+    st.session_state.abaqus_nu = 0.33
+
+    # Mesh seed: in *model units*, and should NOT be scaled by auto unit detection
+    st.session_state.abaqus_mesh_seed_model_units = 250.0
+
+    # config hash
     st.session_state.last_config_hash = None
-
 
 def apply_config_once_if_new(uploaded_bytes: bytes) -> Tuple[bool, List[str], pd.DataFrame]:
     warnings = []
@@ -895,46 +397,53 @@ def apply_config_once_if_new(uploaded_bytes: bytes) -> Tuple[bool, List[str], pd
         try_set_float("scale_x", "ScaleX")
         try_set_float("scale_z", "ScaleZ")
         try_set_float("twist_total_deg", "TwistTotalDeg")
-
         if "TwistSign" in params:
             try:
                 st.session_state.twist_sign = +1.0 if float(params["TwistSign"]) >= 0 else -1.0
             except Exception:
                 warnings.append("Parameter 'TwistSign' invalid; ignored.")
 
-        # Abaqus params if present
-        if "AbaqusLoadMag" in params:
-            try_set_float("abaqus_load_mag", "AbaqusLoadMag")
+        # Abaqus units (kN, MPa, model-units mesh seed)
+        if "AbaqusLoadMag_kN" in params:
+            try_set_float("abaqus_load_mag_kN", "AbaqusLoadMag_kN")
+        elif "AbaqusLoadMag" in params:
+            # backward-compatible: assume old was N
+            try:
+                st.session_state.abaqus_load_mag_kN = float(params["AbaqusLoadMag"]) / 1000.0
+            except Exception:
+                warnings.append("Parameter 'AbaqusLoadMag' invalid; ignored.")
+
         if "AbaqusU" in params:
             try_set_float("abaqus_u", "AbaqusU")
-        if "AbaqusFlipNormal" in params:
-            try:
-                st.session_state.abaqus_flip_normal = bool(int(float(params["AbaqusFlipNormal"])))
-            except Exception:
-                warnings.append("AbaqusFlipNormal invalid; ignored.")
 
-        # Abaqus material overrides
         if "AbaqusMaterialName" in params:
             st.session_state.abaqus_material_name = str(params["AbaqusMaterialName"])
-        if "AbaqusE" in params:
-            try_set_float("abaqus_E", "AbaqusE")
+
+        if "AbaqusE_MPa" in params:
+            try_set_float("abaqus_E_MPa", "AbaqusE_MPa")
+        elif "AbaqusE" in params:
+            # backward-compatible: old was Pa
+            try:
+                st.session_state.abaqus_E_MPa = float(params["AbaqusE"]) / 1e6
+            except Exception:
+                warnings.append("Parameter 'AbaqusE' invalid; ignored.")
+
         if "AbaqusNu" in params:
             try_set_float("abaqus_nu", "AbaqusNu")
-        if "AbaqusMeshSeed" in params:
-            try_set_float("abaqus_mesh_seed", "AbaqusMeshSeed")
 
-        # Model naming overrides
-        if "AbaqusModelName" in params:
-            st.session_state.abaqus_model_name = str(params["AbaqusModelName"])
+        if "AbaqusMeshSeed_ModelUnits" in params:
+            try_set_float("abaqus_mesh_seed_model_units", "AbaqusMeshSeed_ModelUnits")
+        elif "AbaqusMeshSeed" in params:
+            try_set_float("abaqus_mesh_seed_model_units", "AbaqusMeshSeed")
+
         if "AbaqusPartName" in params:
             st.session_state.abaqus_part_name = str(params["AbaqusPartName"])
-        if "AbaqusInstanceName" in params:
-            st.session_state.abaqus_instance_name = str(params["AbaqusInstanceName"])
-        if "AbaqusStepName" in params:
-            st.session_state.abaqus_step_name = str(params["AbaqusStepName"])
         if "AbaqusJobName" in params:
             st.session_state.abaqus_job_name = str(params["AbaqusJobName"])
+        if "AbaqusScriptFilename" in params:
+            st.session_state.abaqus_script_filename = str(params["AbaqusScriptFilename"])
 
+    # Root curve1 CPs from config (optional)
     cp_df = load_bezier_control_points(BytesIO(uploaded_bytes))
     if cp_df is not None:
         sub = cp_df[(cp_df.get("Section") == "Root") & (cp_df.get("Curve") == 1)]
@@ -959,36 +468,171 @@ def apply_config_once_if_new(uploaded_bytes: bytes) -> Tuple[bool, List[str], pd
 
     return applied, warnings, variant_table
 
+# =========================================================
+# Plotting
+# =========================================================
+
+def apply_common_layout_tweaks(fig, title, x_range=None, z_range=None, x_label="x", z_label="z"):
+    fig.update_layout(
+        title=title,
+        xaxis_title=x_label,
+        yaxis_title=z_label,
+        width=None,
+        height=600,
+        margin=dict(l=40, r=20, t=60, b=60),
+        legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
+    )
+    fig.update_yaxes(scaleanchor="x", scaleratio=1)
+    fig.update_yaxes(zeroline=True, zerolinewidth=2)
+    fig.add_hline(y=0, line_width=1, line_dash="dash", opacity=0.5)
+    if x_range is not None:
+        fig.update_xaxes(range=x_range)
+    if z_range is not None:
+        fig.update_yaxes(range=z_range)
+    return fig
+
+def compute_axis_ranges(root_c1, root_c2, tip_c1_top_2d, tip_c2_top_2d, tip_c1_bottom_2d, tip_c2_bottom_2d):
+    x_list = [root_c1[:, 0], root_c2[:, 0]]
+    z_list = [root_c1[:, 1], root_c2[:, 1]]
+    for arr in [tip_c1_top_2d, tip_c2_top_2d, tip_c1_bottom_2d, tip_c2_bottom_2d]:
+        if arr is not None:
+            x_list.append(arr[:, 0])
+            z_list.append(arr[:, 1])
+    x_all = np.concatenate(x_list)
+    z_all = np.concatenate(z_list)
+    x_min, x_max = float(np.min(x_all)), float(np.max(x_all))
+    z_min, z_max = float(np.min(z_all)), float(np.max(z_all))
+    dx = (x_max - x_min) or 1.0
+    dz = (z_max - z_min) or 1.0
+    margin_x = 0.05 * dx
+    margin_z = 0.05 * dz
+    return [x_min - margin_x, x_max + margin_x], [z_min - margin_z, z_max + margin_z]
+
+def make_root_and_tip_plot_only(
+    root_c1, root_c2,
+    tip_c1_top_2d, tip_c2_top_2d,
+    tip_c1_bottom_2d, tip_c2_bottom_2d,
+    x_range, z_range,
+    arrow_head_xz: Tuple[float, float],
+    arrow_dir_xz_unit: Tuple[float, float],
+    arrow_len: float,
+):
+    fig = go.Figure()
+
+    # Root (solid)
+    u1, x1, z1_top = general_bezier_curve(root_c1)
+    u2, x2, z2_top = general_bezier_curve(root_c2)
+    fig.add_trace(go.Scatter(x=x1, y=z1_top, mode="lines", name="Root C1 top", line=dict(color=COLOR_ROOT_C1)))
+    fig.add_trace(go.Scatter(x=x2, y=z2_top, mode="lines", name="Root C2 top", line=dict(color=COLOR_ROOT_C2)))
+    fig.add_trace(go.Scatter(x=x1, y=-z1_top, mode="lines", name="Root C1 bottom", line=dict(color=COLOR_ROOT_C1)))
+    fig.add_trace(go.Scatter(x=x2, y=-z2_top, mode="lines", name="Root C2 bottom", line=dict(color=COLOR_ROOT_C2)))
+
+    # Tip (dashed)
+    u1t, x1t, z1t = general_bezier_curve(tip_c1_top_2d)
+    u2t, x2t, z2t = general_bezier_curve(tip_c2_top_2d)
+    u1b, x1b, z1b = general_bezier_curve(tip_c1_bottom_2d)
+    u2b, x2b, z2b = general_bezier_curve(tip_c2_bottom_2d)
+
+    fig.add_trace(go.Scatter(x=x1t, y=z1t, mode="lines", name="Tip C1 top",
+                             line=dict(dash="dash", color=COLOR_TIP_C1)))
+    fig.add_trace(go.Scatter(x=x2t, y=z2t, mode="lines", name="Tip C2 top",
+                             line=dict(dash="dash", color=COLOR_TIP_C2)))
+    fig.add_trace(go.Scatter(x=x1b, y=z1b, mode="lines", name="Tip C1 bottom",
+                             line=dict(dash="dash", color=COLOR_TIP_C1)))
+    fig.add_trace(go.Scatter(x=x2b, y=z2b, mode="lines", name="Tip C2 bottom",
+                             line=dict(dash="dash", color=COLOR_TIP_C2)))
+
+    # Force arrow (annotation): HEAD touches curve (at arrow_head_xz)
+    hx, hz = float(arrow_head_xz[0]), float(arrow_head_xz[1])
+    dx, dz = float(arrow_dir_xz_unit[0]), float(arrow_dir_xz_unit[1])
+    # tail behind head, so arrow points INTO the curve point
+    tx = hx - arrow_len * dx
+    tz = hz - arrow_len * dz
+
+    fig.update_layout(
+        annotations=[
+            dict(
+                x=hx, y=hz,
+                ax=tx, ay=tz,
+                xref="x", yref="y",
+                axref="x", ayref="y",
+                showarrow=True,
+                arrowhead=3,
+                arrowsize=1.0,   # slightly smaller
+                arrowwidth=2,
+                text="",         # remove label text
+            )
+        ]
+    )
+
+    return apply_common_layout_tweaks(
+        fig,
+        "Blade Outer Profile (Root & Tip, mirrored)",
+        x_range=x_range,
+        z_range=z_range,
+        x_label="x (chord-direction)",
+        z_label="z (thickness-direction)",
+    )
+
+def make_hub_plot(hub_cp_xz, hub_plane_label="X–Z"):
+    u, a_vals, z_vals = general_bezier_curve(hub_cp_xz)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=a_vals, y=z_vals, mode="lines",
+        name="Hub profile",
+        line=dict(color=COLOR_HUB),
+        customdata=np.column_stack([u]),
+        hovertemplate=(
+            f"Hub profile ({hub_plane_label})<br>u=%{{customdata[0]:.3f}}<br>"
+            f"{hub_plane_label.split('–')[0]}=%{{x:.4f}}<br>Z=%{{y:.4f}}<extra></extra>"
+        ),
+    ))
+    fig.add_trace(go.Scatter(
+        x=hub_cp_xz[:, 0], y=hub_cp_xz[:, 1],
+        mode="lines+markers",
+        name="Hub CPs",
+        line=dict(dash="dot", color=COLOR_HUB),
+        marker=dict(color=COLOR_HUB),
+        hovertemplate=(
+            f"Hub CP<br>{hub_plane_label.split('–')[0]}=%{{x:.4f}}<br>Z=%{{y:.4f}}<extra></extra>"
+        ),
+    ))
+    xlab = f"{hub_plane_label.split('–')[0]} (hub plane)"
+    return apply_common_layout_tweaks(fig, f"Hub external profile",
+                                     x_label=xlab, z_label="Z")
 
 # =========================================================
-# Abaqus script generator - USES YOUR PROVIDED ABAQUS.PY TEMPLATE
+# Abaqus script generator (uses your refined template, with requested tweaks)
+#   - Load magnitude UI = kN (converted to N in script)
+#   - E UI = MPa (converted to Pa in script)
+#   - Mesh seed is NOT scaled by UNIT_SCALE (stays in model units)
+#   - No flip toggle; direction forced to "into blade" (negative Z) for top curve
 # =========================================================
 
-def generate_abaqus_script_from_your_template(
-    model_name: str,
+def generate_abaqus_post_import_script_refined(
     part_name: str,
-    instance_name: str,
-    material_name: str,
-    step_name: str,
     job_name: str,
-    E: float,
+    script_model_name: str,         # keep fixed to Model-1 unless you decide to expose later
+    instance_name: str,             # keep fixed to Blade-1 (script can create/reuse)
+    material_name: str,
+    E_MPa: float,
     nu: float,
-    shell_t: float,
-    mesh_seed: float,
+    shell_thickness_m: float,
+    mesh_seed_model_units: float,
     load_u: float,
-    load_point_xyz: Tuple[float, float, float],
-    force_vec_xyz: Tuple[float, float, float],
-) -> str:
-    # Guard: avoid u=0 or u=1 which can break PartitionEdgeByParam
-    u = float(load_u)
-    u = min(max(u, 1e-6), 1.0 - 1e-6)
+    load_point_m: Tuple[float, float, float],
+    force_vec_N: Tuple[float, float, float],
+):
+    MODEL_NAME = script_model_name
+    PART_NAME = part_name
+    INSTANCE_NAME = instance_name
+    MATERIAL_NAME = material_name
+    STEP_NAME = "Step-1"
 
-    lx, ly, lz = [float(v) for v in load_point_xyz]
-    fx, fy, fz = [float(v) for v in force_vec_xyz]
+    # Convert MPa -> Pa for Abaqus
+    E_Pa = float(E_MPa) * 1e6
 
-    return f"""# -*- coding: utf-8 -*-
-# Abaqus/CAE script (POST-IMPORT) generated by Streamlit
-# Assumes your blade part already exists in the model database.
+    return f"""#Code: V1.5.3
 
 from abaqus import mdb
 from abaqusConstants import *
@@ -997,35 +641,34 @@ import mesh
 import math
 
 # =========================================================
-# USER INPUTS (match your model tree)
+# USER INPUTS
 # =========================================================
-MODEL_NAME    = r"{model_name}"
-PART_NAME     = r"{part_name}"
-INSTANCE_NAME = r"{instance_name}"
+MODEL_NAME    = r"{MODEL_NAME}"
+PART_NAME     = r"{PART_NAME}"
+INSTANCE_NAME = r"{INSTANCE_NAME}"
 
-MATERIAL_NAME = r"{material_name}"
-STEP_NAME     = r"{step_name}"
+MATERIAL_NAME = r"{MATERIAL_NAME}"
+STEP_NAME     = r"{STEP_NAME}"
 JOB_NAME      = r"{job_name}"
 
-# Material / section
-E       = {E:.16g}
-NU      = {nu:.16g}
-SHELL_T = {shell_t:.16g}
 
-# Mesh
-MESH_SEED = {mesh_seed:.16g}
+E       = {E_Pa:.16g}
+NU      = {float(nu):.16g}
+SHELL_T = {float(shell_thickness_m):.16g}  
 
-# Load definition (from Streamlit)
-LOAD_U = {u:.16g}
-LOAD_POINT = ({lx:.16g}, {ly:.16g}, {lz:.16g})
-FORCE_VEC  = ({fx:.16g}, {fy:.16g}, {fz:.16g})
+
+MESH_SEED = {float(mesh_seed_model_units):.16g}
+
+
+LOAD_U = {float(load_u):.16g}
+LOAD_POINT = ({float(load_point_m[0]):.16g}, {float(load_point_m[1]):.16g}, {float(load_point_m[2]):.16g})
+FORCE_VEC  = ({float(force_vec_N[0]):.16g}, {float(force_vec_N[1]):.16g}, {float(force_vec_N[2]):.16g})
 
 # =========================================================
 # UNIT HANDLING
 # =========================================================
 AUTO_UNIT_SCALE = True
 UNIT_SCALE = 1.0
-# If AUTO_UNIT_SCALE=True, UNIT_SCALE will be inferred from geometry vs LOAD_POINT.y
 
 # =========================================================
 # Logging
@@ -1069,22 +712,14 @@ def get_or_create_instance(model, part_obj):
 # Bounding box WITHOUT part.getBoundingBox()
 # =========================================================
 def bbox_from_part_geometry(part_obj):
-    \"\"\"
-    Compute an approximate bounding box by sampling geometry points.
-    Works in Abaqus versions where Part.getBoundingBox() does not exist.
-    \"\"\"
     pts = []
-
-    # Prefer vertices
     try:
-        verts = part_obj.vertices
-        for v in verts:
+        for v in part_obj.vertices:
             p = v.pointOn[0]
             pts.append((float(p[0]), float(p[1]), float(p[2])))
     except Exception as ex:
         log("WARNING: Could not read vertices for bbox: %s" % ex)
 
-    # Fallback: edge sample points
     if len(pts) == 0:
         try:
             for e in part_obj.edges:
@@ -1096,7 +731,6 @@ def bbox_from_part_geometry(part_obj):
     xs = [p[0] for p in pts]
     ys = [p[1] for p in pts]
     zs = [p[2] for p in pts]
-
     low  = (min(xs), min(ys), min(zs))
     high = (max(xs), max(ys), max(zs))
     return low, high
@@ -1174,7 +808,7 @@ def ensure_step(model):
     log("Created step: %s" % STEP_NAME)
 
 # =========================================================
-# Edge selection: Curve2 top at tip (STRICT)
+# Edge selection: Tip top edge near LOAD_POINT (STRICT)
 # =========================================================
 def edge_avg_point(edge_obj):
     pts = edge_obj.pointOn
@@ -1244,7 +878,7 @@ def partition_edge_by_u(part_obj, inst_edge, u_param):
     log("PartitionEdgeByParam succeeded at u=%.4f" % float(u_param))
 
 # =========================================================
-# Root BC
+# Root BC (create sets on ASSEMBLY)
 # =========================================================
 def apply_root_pinned_bc(model, inst, root_y, tol_y):
     log("Applying pinned BC at root (y≈%.6g, tol=%.6g)..." % (root_y, tol_y))
@@ -1283,7 +917,7 @@ def apply_root_pinned_bc(model, inst, root_y, tol_y):
     log("Pinned BC applied on root edges.")
 
 # =========================================================
-# Meshing
+# Meshing (mesh seed is NOT scaled)
 # =========================================================
 def mesh_part(part_obj, mesh_seed):
     log("Meshing part (seed=%.6g)..." % float(mesh_seed))
@@ -1319,7 +953,6 @@ def closest_node(nodes_obj, xyz):
             return first[0]
         if hasattr(first, "label"):
             return first
-
     return None
 
 def apply_concentrated_force_at_loadpoint(model, inst, load_point, force_vec):
@@ -1395,6 +1028,7 @@ def main():
     part_obj = get_part(model)
     inst = get_or_create_instance(model, part_obj)
 
+    # Detect geometry extents + infer unit scale if needed
     log("Stage: detect geometry extents / unit scale")
     inferred_scale, root_y_raw, tip_y_raw, bb_low, bb_high = detect_unit_scale_from_geometry(part_obj, LOAD_POINT)
 
@@ -1404,47 +1038,57 @@ def main():
     log("BBox (geometry sample): low=%s high=%s" % (str(bb_low), str(bb_high)))
     log("Detected root_y=%.6g, tip_y=%.6g" % (float(root_y_raw), float(tip_y_raw)))
 
+    # Build scaled quantities (NOTE: mesh seed is NOT scaled)
     shell_t_scaled = float(SHELL_T) * float(UNIT_SCALE)
-    mesh_seed_scaled = float(MESH_SEED) * float(UNIT_SCALE)
+    mesh_seed_scaled = float(MESH_SEED)  # <-- requested behaviour
     load_point_scaled = (float(LOAD_POINT[0]) * float(UNIT_SCALE),
                          float(LOAD_POINT[1]) * float(UNIT_SCALE),
                          float(LOAD_POINT[2]) * float(UNIT_SCALE))
 
     log("UNIT_SCALE=%.6g" % float(UNIT_SCALE))
-    log("Scaled: SHELL_T=%.6g, MESH_SEED=%.6g, LOAD_POINT=%s"
+    log("Scaled: SHELL_T=%.6g, MESH_SEED(unscaled)=%.6g, LOAD_POINT=%s"
         % (shell_t_scaled, mesh_seed_scaled, str(load_point_scaled)))
 
+    # Tolerances based on tip/root scale
     span = float(tip_y_raw - root_y_raw)
     tol_y = max(1e-6, 1e-4 * abs(span) if abs(span) > 0 else 1e-6)
     log("tol_y=%.6g (based on span=%.6g)" % (tol_y, span))
 
+    # Material/section and step
     log("Stage: material + section")
     ensure_material_and_section(model, part_obj, shell_t_scaled)
 
     log("Stage: step")
     ensure_step(model)
 
+    # Identify tip edge near the load point (strict)
     log("Stage: identify tip top edge near LOAD_POINT")
     curve2_tip_edge = find_tip_top_edge_near_loadpoint(inst, tip_y_raw, tol_y, load_point_scaled)
 
+    # Partition by u BEFORE meshing
     log("Stage: partition selected edge at u")
     partition_edge_by_u(part_obj, curve2_tip_edge, LOAD_U)
 
+    # Regenerate assembly after geometry change
     log("Stage: regenerate assembly (post-partition)")
     model.rootAssembly.regenerate()
 
+    # Mesh after partition
     log("Stage: mesh")
     mesh_part(part_obj, mesh_seed_scaled)
 
     log("Stage: regenerate assembly (post-mesh)")
     model.rootAssembly.regenerate()
 
+    # Root BC
     log("Stage: root BC")
     apply_root_pinned_bc(model, inst, root_y_raw, tol_y)
 
+    # Apply load at closest node to LOAD_POINT (should now be at partition location)
     log("Stage: apply load")
     apply_concentrated_force_at_loadpoint(model, inst, load_point_scaled, FORCE_VEC)
 
+    # Run job
     log("Stage: run job")
     make_job_and_run()
 
@@ -1453,6 +1097,103 @@ def main():
 main()
 """
 
+# =========================================================
+# Downloads
+#   - Design table Excel (matches your attached format)
+#   - Blade control points (Excel: Root sheet + Tip sheet; includes Curve1+Curve2 for both)
+#   - Abaqus script (.py)
+#   - Config template
+# =========================================================
+
+def build_design_table_excel_from_template(values_by_header: dict) -> bytes:
+    if not os.path.exists(DESIGN_TABLE_TEMPLATE_PATH):
+        # If template isn't present, fall back to a simple workbook
+        df = pd.DataFrame([values_by_header])
+        buf = BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+            df.to_excel(w, sheet_name=DESIGN_TABLE_SHEET_NAME, index=False)
+        return buf.getvalue()
+
+    wb = openpyxl.load_workbook(DESIGN_TABLE_TEMPLATE_PATH)
+    if DESIGN_TABLE_SHEET_NAME not in wb.sheetnames:
+        ws = wb.active
+    else:
+        ws = wb[DESIGN_TABLE_SHEET_NAME]
+
+    # Read header row 1
+    headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+
+    # Ensure row 2 exists
+    out_row = 2
+
+    # Write values where header matches
+    header_to_col = {str(h): idx + 1 for idx, h in enumerate(headers) if h is not None}
+    for h, v in values_by_header.items():
+        if h in header_to_col:
+            ws.cell(row=out_row, column=header_to_col[h]).value = v
+
+    out = BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+def build_blade_control_points_excel(
+    root_c1: np.ndarray,
+    root_c2: np.ndarray,
+    tip_c1_3d: np.ndarray,
+    tip_c2_3d: np.ndarray,
+) -> bytes:
+    # Root in XZ (Y=0), Tip in XYZ (Y=blade length already in arrays)
+    rows_root = []
+    for curve_name, cp in [("Root Curve 1", root_c1), ("Root Curve 2", root_c2)]:
+        for i in range(cp.shape[0]):
+            rows_root.append(
+                {"Curve": curve_name, "PointIndex": i, "X": float(cp[i, 0]), "Y": 0.0, "Z": float(cp[i, 1])}
+            )
+    df_root = pd.DataFrame(rows_root)
+
+    rows_tip = []
+    for curve_name, cp in [("Tip Curve 1", tip_c1_3d), ("Tip Curve 2", tip_c2_3d)]:
+        for i in range(cp.shape[0]):
+            rows_tip.append(
+                {"Curve": curve_name, "PointIndex": i, "X": float(cp[i, 0]), "Y": float(cp[i, 1]), "Z": float(cp[i, 2])}
+            )
+    df_tip = pd.DataFrame(rows_tip)
+
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        df_root.to_excel(writer, sheet_name="Root_Control_Points", index=False)
+        df_tip.to_excel(writer, sheet_name="Tip_Control_Points", index=False)
+    return buf.getvalue()
+
+def build_config_template_excel() -> bytes:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        default_variant_table().to_excel(writer, sheet_name="Table1_BladeVariants", index=False)
+        pd.DataFrame({
+            "Name": [
+                "NumBlades", "ScaleX", "ScaleZ", "TwistTotalDeg", "TwistSign",
+                "AbaqusLoadMag_kN", "AbaqusU",
+                "AbaqusMaterialName", "AbaqusE_MPa", "AbaqusNu",
+                "AbaqusMeshSeed_ModelUnits",
+                "AbaqusPartName", "AbaqusJobName", "AbaqusScriptFilename",
+            ],
+            "Value": [
+                3, 0.8, 0.8, 15.0, +1,
+                1.0, 0.5,
+                "BladeMaterial", 70000.0, 0.33,
+                250.0,
+                "Blade", "BladeJob", "abaqus.py",
+            ]
+        }).to_excel(writer, sheet_name="Parameters", index=False)
+        pd.DataFrame({
+            "Section": ["Root"]*4, "Curve": [1]*4, "PointIndex": [0, 1, 2, 3],
+            "X": [1.0, 1.0, 0.8, 0.6], "Z": [0.0, 0.06, 0.08, 0.075]
+        }).to_excel(writer, sheet_name="BezierControlPoints", index=False)
+        pd.DataFrame({
+            "PointIndex": [0, 1, 2, 3],
+            "X": [-0.4, 0.3, 13.0, 2.0], "Z": [1.0, 1.0, 0.8, 0.0]
+        }).to_excel(writer, sheet_name="HubControlPoints", index=False)
+    return buf.getvalue()
 
 # =========================================================
 # Streamlit app
@@ -1460,155 +1201,128 @@ main()
 
 def main():
     st.set_page_config(page_title="CAE4 Blade & Hub Tool", layout="wide")
+    keep_scroll_position()
     ensure_state_defaults()
 
-    # ---------- Sidebar: upload early ----------
+    # ----------------------------
+    # Sidebar (inputs)
+    #   - Downloads first
+    #   - Config uploader at bottom (under downloads)
+    # ----------------------------
     with st.sidebar:
-        with st.expander("Config", expanded=False):
-            st.markdown("**Excel configuration (optional)**")
-            uploaded_file = st.file_uploader(
-                "Upload Excel configuration (optional)",
-                type=["xlsx"],
-                key="excel_upload",
-            )
-        uploaded_bytes = uploaded_file.read() if uploaded_file is not None else None
+        st.markdown("### Blade inputs")
 
-    config_applied, config_warnings, variant_table = apply_config_once_if_new(uploaded_bytes)
 
-    # ---------- Sidebar: widgets ----------
-    with st.sidebar:
-        with st.expander("Blade geometry inputs", expanded=True):
-            st.markdown("**Root Curve 1 – Control Points**")
+    
+    
+        with st.expander("Blade geometry inputs", expanded=False):
+            st.markdown("**Root – Control Points (X–Z)**")
 
-            st.number_input("Curve 1 P0 x", key="c1_p0_x", format="%.4f")
-            st.number_input("Curve 1 P0 z", key="c1_p0_z", format="%.4f")
-
-            st.number_input("Curve 1 P1 x", key="c1_p1_x", format="%.4f")
-            st.number_input("Curve 1 P1 z", key="c1_p1_z", format="%.4f")
-
-            st.number_input("Curve 1 P2 x", key="c1_p2_x", format="%.4f")
-            st.number_input("Curve 1 P2 z", key="c1_p2_z", format="%.4f")
-
-            st.number_input("Curve 1 P3 x", key="c1_p3_x", format="%.4f")
-            st.number_input("Curve 1 P3 z", key="c1_p3_z", format="%.4f")
+            # P0..P3 in two columns (x next to z)
+            for i in range(4):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.number_input(f"Curve 1 P{i} x", key=f"c1_p{i}_x", format="%.6f")
+                with col2:
+                    st.number_input(f"Curve 1 P{i} z", key=f"c1_p{i}_z", format="%.6f")
 
             st.markdown("---")
-            st.markdown("**Blade variant (Table 1) + tip transform**")
+            st.markdown("**Blade variant + tip transform**")
 
             blade_opts = st.session_state.get("blade_options", [3, 4, 5])
             if not blade_opts:
                 blade_opts = [3, 4, 5]
                 st.session_state.blade_options = blade_opts
-
             if int(st.session_state.num_blades) not in blade_opts:
                 st.session_state.num_blades = int(blade_opts[0])
 
             st.selectbox(
-                "Number of blades (from variant table)",
+                "Number of blades",
                 options=blade_opts,
                 key="num_blades",
             )
 
-            st.number_input("Scale factor in X (example 0.8)", min_value=0.1, max_value=3.0, step=0.05, key="scale_x")
-            st.number_input("Scale factor in Z (example 0.8)", min_value=0.1, max_value=3.0, step=0.05, key="scale_z")
+            colA, colB = st.columns(2)
+            with colA:
+                st.number_input("X Scale factor", min_value=0.1, max_value=3.0, step=0.05, key="scale_x")
+            with colB:
+                st.number_input("Z Scale factor", min_value=0.1, max_value=3.0, step=0.05, key="scale_z")
 
             st.number_input(
                 "Total twist from root to tip (degrees)",
-                min_value=0.0,
+                min_value=-90.0,
                 max_value=90.0,
                 step=0.5,
                 format="%.2f",
                 key="twist_total_deg",
             )
-            twist_direction = st.selectbox(
-                "Twist direction",
-                ["Positive", "Negative"],
-                index=0 if st.session_state.twist_sign >= 0 else 1,
-                key="twist_direction_ui",
-            )
-            st.session_state.twist_sign = +1.0 if twist_direction == "Positive" else -1.0
+            # Twist direction dropdown removed; sign comes from +/- twist_total_deg
+            st.session_state.twist_sign = +1.0 if float(st.session_state.twist_total_deg) >= 0 else -1.0
 
         with st.expander("Hub geometry inputs", expanded=False):
-            st.markdown("**Hub profile – Control Points (X–Z by default)**")
-            st.number_input("Hub P0 X", key="hub_p0_x", format="%.4f")
-            st.number_input("Hub P0 Z", key="hub_p0_z", format="%.4f")
+            st.markdown("**Hub profile – Control Points (X–Z)**")
+            for i in range(4):
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.number_input(f"Hub P{i} X", key=f"hub_p{i}_x", format="%.6f")
+                with c2:
+                    st.number_input(f"Hub P{i} Z", key=f"hub_p{i}_z", format="%.6f")
 
-            st.number_input("Hub P1 X", key="hub_p1_x", format="%.4f")
-            st.number_input("Hub P1 Z", key="hub_p1_z", format="%.4f")
+        with st.expander("Abaqus", expanded=False):
+            st.markdown("**Applied Curve 2 Tip Load**")
 
-            st.number_input("Hub P2 X", key="hub_p2_x", format="%.4f")
-            st.number_input("Hub P2 Z", key="hub_p2_z", format="%.4f")
 
-            st.number_input("Hub P3 X", key="hub_p3_x", format="%.4f")
-            st.number_input("Hub P3 Z", key="hub_p3_z", format="%.4f")
+            st.number_input("Load (kN)", min_value=0.0, step=0.1, format="%.3f", key="abaqus_load_mag_kN")
 
-        with st.expander("Plot visibility", expanded=False):
-            st.checkbox("Show root curves", key="show_root")
-            st.checkbox("Show tip curves", key="show_tip")
-
-        # Abaqus controls in sidebar
-        with st.expander("Abaqus", expanded=True):
-            st.markdown("**Load definition**")
-            st.number_input("Load magnitude (N)", min_value=0.0, step=50.0, key="abaqus_load_mag")
-
-            # IMPORTANT: keep u away from exactly 0 or 1 to avoid partition edge issues
-            st.slider("Force location u along TIP Curve2 TOP", min_value=0.01, max_value=0.99, step=0.01, key="abaqus_u")
-
-            st.checkbox("Flip normal direction", key="abaqus_flip_normal")
+                # Keep u away from 0/1 because PartitionEdgeByParam needs (0,1)
+            st.slider("Load location U (0–1)", min_value=0.01, max_value=0.99, step=0.01, key="abaqus_u")
 
             st.markdown("---")
             st.markdown("**Material**")
             st.text_input("Material name", key="abaqus_material_name")
-            st.number_input("Young's modulus E (Pa)", min_value=0.0, step=1e9, format="%.6g", key="abaqus_E")
-            st.number_input("Poisson's ratio ν", min_value=0.0, max_value=0.499, step=0.01, format="%.4f", key="abaqus_nu")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.number_input("Young's modulus E (MPa)", min_value=0.0, step=1000.0, format="%.3f", key="abaqus_E_MPa")
+            with c2:
+                st.number_input("Poisson's ratio ν", min_value=0.0, max_value=0.499, step=0.01, format="%.4f", key="abaqus_nu")
 
             st.markdown("---")
-            st.markdown("**Model / part / instance / mesh / job**")
-            st.text_input("Abaqus model name (mdb.models key)", key="abaqus_model_name")
-            st.text_input("Part name (imported blade part)", key="abaqus_part_name")
-            st.text_input("Instance name (created if needed)", key="abaqus_instance_name")
-            st.number_input("Global mesh seed size (model units)", min_value=0.0, step=0.1, format="%.6g", key="abaqus_mesh_seed")
-            st.text_input("Step name", key="abaqus_step_name")
+            st.markdown("**Part / mesh / run naming**")
+            st.text_input("Imported part name", key="abaqus_part_name")
+            st.number_input(
+                "Global mesh seed size",
+                min_value=0.0, step=1.0, format="%.6g",
+                key="abaqus_mesh_seed_model_units",
+            )
             st.text_input("Job name", key="abaqus_job_name")
+            st.text_input("Abaqus script filename", key="abaqus_script_filename")
 
-        downloads_placeholder = st.empty()
+        # Config uploader at bottom (under downloads)
+        with st.expander("Config", expanded=False):
+            uploaded_file = st.file_uploader(
+                "Upload Excel configuration (optional)",
+                type=["xlsx"],
+                key="excel_upload",
+            )
+            uploaded_bytes = uploaded_file.read() if uploaded_file is not None else None
 
-    st.title("CAE4 – Blade & Hub Parametric Tool")
-
-    tab_overview, tab_blade, tab_3d, tab_hub, tab_cfd, tab_abaqus = st.tabs(
-        ["Overview", "Blade geometry", "3D preview", "Hub geometry", "CFD domain", "Abaqus config"]
+    # Apply config once per file change
+    config_applied, config_warnings, variant_table = apply_config_once_if_new(
+        uploaded_bytes if "uploaded_bytes" in locals() else None
     )
 
-    with tab_overview:
-        st.header("Overview")
-        if config_applied:
-            st.success("Config applied (as new defaults). You can now tweak values in the sidebar without them reverting.")
-        if config_warnings:
-            for w in config_warnings:
-                st.info(w)
-
-        st.markdown(
-            """
-            **Abaqus script generation**
-            - This app generates an Abaqus script using your **known-good Abaqus.py template**
-            - The only changes are injected UI values (model/part names, material, thickness, mesh seed, load u, LOAD_POINT, FORCE_VEC)
-            - The script avoids `part.getBoundingBox()` so it works on older Abaqus versions.
-            """
-        )
-
     # =========================================================
-    # Compute geometry from current session_state
+    # Compute geometry from session_state
     # =========================================================
-
     num_blades = int(st.session_state.num_blades)
     blade_length_m, blade_thickness_m = blade_length_and_thickness_from_table(num_blades, variant_table)
 
     scale_x = float(st.session_state.scale_x)
     scale_z = float(st.session_state.scale_z)
     twist_total_deg = float(st.session_state.twist_total_deg)
-    twist_sign = float(st.session_state.twist_sign)
-
-    twist_deg_per_m = twist_total_deg / blade_length_m if blade_length_m > 0 else 0.0
+    twist_sign = +1.0 if twist_total_deg >= 0 else -1.0
+    twist_deg_per_m = (abs(twist_total_deg) / blade_length_m) if blade_length_m > 0 else 0.0
 
     root_c1_cubic = np.array(
         [
@@ -1619,22 +1333,26 @@ def main():
         ],
         dtype=float,
     )
-
     root_c2_cubic = compute_curve2_cubic_c2(root_c1_cubic, trailing_edge=(0.0, 0.0))
-    c0_res, c1_res, c2_res = continuity_residuals_cubic(root_c1_cubic, root_c2_cubic)
 
     root_all_cps_top = np.vstack([root_c1_cubic, root_c2_cubic])
     root_all_cps_bottom = root_all_cps_top.copy()
     root_all_cps_bottom[:, 1] *= -1.0
 
     tip_all_top_2d, tip_all_top_3d = transform_tip_from_root(
-        root_all_cps_top, scale_x=scale_x, scale_z=scale_z,
-        twist_deg_per_m=twist_deg_per_m, blade_length=blade_length_m,
+        root_all_cps_top,
+        scale_x=scale_x,
+        scale_z=scale_z,
+        twist_deg_per_m=twist_deg_per_m,
+        blade_length=blade_length_m,
         twist_sign=twist_sign,
     )
     tip_all_bottom_2d, _ = transform_tip_from_root(
-        root_all_cps_bottom, scale_x=scale_x, scale_z=scale_z,
-        twist_deg_per_m=twist_deg_per_m, blade_length=blade_length_m,
+        root_all_cps_bottom,
+        scale_x=scale_x,
+        scale_z=scale_z,
+        twist_deg_per_m=twist_deg_per_m,
+        blade_length=blade_length_m,
         twist_sign=twist_sign,
     )
 
@@ -1653,7 +1371,8 @@ def main():
         tip_c1_bottom_2d, tip_c2_bottom_2d,
     )
 
-    hub_cp_az = np.array(
+    # Hub CPs
+    hub_cp_xz = np.array(
         [
             [st.session_state.hub_p0_x, st.session_state.hub_p0_z],
             [st.session_state.hub_p1_x, st.session_state.hub_p1_z],
@@ -1662,23 +1381,18 @@ def main():
         ],
         dtype=float,
     )
-    hub_plane_label = "X–Z"
-    hub_source_label = "Sidebar Hub CP inputs (X–Z)"
 
+    # Chord estimate (for arrow scaling)
     x_all_root = np.concatenate([root_c1_cubic[:, 0], root_c2_cubic[:, 0]])
-    chord_length = float(np.max(x_all_root) - 0.0)
+    chord_length = float(np.max(x_all_root) - 0.0) if x_all_root.size else 1.0
 
-    cfd_x_min = -CFD_X_UPSTREAM_CHORDS * chord_length
-    cfd_x_max = CFD_X_DOWNSTREAM_CHORDS * chord_length
-    cfd_y_min = -CFD_RADIAL_CHORDS * chord_length
-    cfd_y_max = +CFD_RADIAL_CHORDS * chord_length
-    cfd_z_min = -CFD_RADIAL_CHORDS * chord_length
-    cfd_z_max = +CFD_RADIAL_CHORDS * chord_length
-
-    # --- Abaqus load definition (Tip curve2-top) ---
+    # =========================================================
+    # Abaqus load intent: computed from TIP Curve2 TOP
+    #   - direction always "into blade": enforce negative Z component on the top curve normal
+    # =========================================================
     load_u = float(st.session_state.abaqus_u)
-    load_mag = float(st.session_state.abaqus_load_mag)
-    flip_normal = bool(st.session_state.abaqus_flip_normal)
+    load_mag_kN = float(st.session_state.abaqus_load_mag_kN)
+    load_mag_N = load_mag_kN * 1000.0
 
     pt2d, tan2d = bezier_point_and_tangent(tip_c2_top_2d, load_u)
     x_u, z_u = float(pt2d[0]), float(pt2d[1])
@@ -1686,215 +1400,234 @@ def main():
 
     tangent_3d = np.array([dxdu, 0.0, dzdu], dtype=float)
     normal_3d = np.array([-tangent_3d[2], 0.0, tangent_3d[0]], dtype=float)
-    norm_mag = float(np.linalg.norm(normal_3d))
-    normal_unit_3d = normal_3d / norm_mag if norm_mag > 0 else np.array([0.0, 0.0, 0.0])
+    nmag = float(np.linalg.norm(normal_3d))
+    normal_unit_3d = (normal_3d / nmag) if nmag > 0 else np.array([0.0, 0.0, -1.0])
 
-    if flip_normal:
+    # Force must go "into the blade" on the TOP curve -> enforce negative Z direction
+    if float(normal_unit_3d[2]) > 0.0:
         normal_unit_3d = -normal_unit_3d
 
-    force_vec = (
-        load_mag * float(normal_unit_3d[0]),
-        load_mag * float(normal_unit_3d[1]),
-        load_mag * float(normal_unit_3d[2]),
-    )
+    fxN = load_mag_N * float(normal_unit_3d[0])
+    fyN = load_mag_N * float(normal_unit_3d[1])
+    fzN = load_mag_N * float(normal_unit_3d[2])
 
-    # load point in the blade coords (used as LOAD_POINT in the Abaqus template)
-    load_point_3d = (x_u, float(blade_length_m), z_u)
+    # Arrow in X–Z only (projection)
+    dir_xz = np.array([float(normal_unit_3d[0]), float(normal_unit_3d[2])], dtype=float)
+    dmag = float(np.linalg.norm(dir_xz))
+    dir_xz_unit = (dir_xz / dmag) if dmag > 0 else np.array([0.0, -1.0])
 
-    # 2D arrow direction
-    dir_xz = np.array([normal_unit_3d[0], normal_unit_3d[2]], dtype=float)
-    dir_xz_mag = float(np.linalg.norm(dir_xz))
-    dir_xz_unit = (dir_xz / dir_xz_mag) if dir_xz_mag > 0 else np.array([0.0, 0.0])
-    arrow_len_2d = 0.15 * chord_length if chord_length > 0 else 0.15
+    # Slightly smaller arrow than before
+    arrow_len = 0.12 * chord_length if chord_length > 0 else 0.12
 
-    # =========================================================
-    # Exports
-    # =========================================================
+    # Abaqus script inputs (LOAD_POINT uses blade_length_m)
+    load_point_m = (x_u, float(blade_length_m), z_u)
+    force_vec_N = (float(fxN), float(fyN), float(fzN))
 
-    # Design table (single configuration)
-    dt_df = pd.DataFrame(
-        {
-            "Config": ["Default"],
-            "Num_Blades": [num_blades],
-            "Blade_Length": [blade_length_m],
-            "Blade_Thickness": [blade_thickness_m],
-            "ScaleX": [scale_x],
-            "ScaleZ": [scale_z],
-            "Twist_Total_Deg": [twist_total_deg],
-            "Twist_Deg_Per_m": [twist_deg_per_m],
-            "Twist_Sign": [twist_sign],
-            "Join_C0_residual": [c0_res],
-            "Join_C1_residual": [c1_res],
-            "Join_C2_residual": [c2_res],
-            "Abaqus_Load_u": [load_u],
-            "Abaqus_LoadMag": [load_mag],
-            "LOAD_POINT_X": [load_point_3d[0]],
-            "LOAD_POINT_Y": [load_point_3d[1]],
-            "LOAD_POINT_Z": [load_point_3d[2]],
-            "FORCE_X": [force_vec[0]],
-            "FORCE_Y": [force_vec[1]],
-            "FORCE_Z": [force_vec[2]],
-            "CFD_Xmin": [cfd_x_min],
-            "CFD_Xmax": [cfd_x_max],
-            "CFD_Ymin": [cfd_y_min],
-            "CFD_Ymax": [cfd_y_max],
-            "CFD_Zmin": [cfd_z_min],
-            "CFD_Zmax": [cfd_z_max],
-            "CFD_Chord": [chord_length],
-        }
-    )
-
-    buf_dt = BytesIO()
-    with pd.ExcelWriter(buf_dt, engine="xlsxwriter") as writer:
-        dt_df.to_excel(writer, sheet_name="DesignTable", index=False)
-        variant_table.to_excel(writer, sheet_name="BladeVariants", index=False)
-    design_table_bytes = buf_dt.getvalue()
-
-    # Config template (fixes the earlier bug where PartName mistakenly became "Model-1")
-    template_bytes = read_template_bytes()
-    if template_bytes is None:
-        buf_cfg = BytesIO()
-        with pd.ExcelWriter(buf_cfg, engine="xlsxwriter") as writer:
-            default_variant_table().to_excel(writer, sheet_name="Table1_BladeVariants", index=False)
-            pd.DataFrame({
-                "Name": [
-                    "NumBlades", "ScaleX", "ScaleZ", "TwistTotalDeg", "TwistSign",
-                    "AbaqusLoadMag", "AbaqusU", "AbaqusFlipNormal",
-                    "AbaqusMaterialName", "AbaqusE", "AbaqusNu", "AbaqusMeshSeed",
-                    "AbaqusModelName", "AbaqusPartName", "AbaqusInstanceName", "AbaqusStepName", "AbaqusJobName",
-                ],
-                "Value": [
-                    3, 0.8, 0.8, 15.0, +1,
-                    1000.0, 0.5, 0,
-                    "BladeMaterial", 70e9, 0.33, 0.25,
-                    "Model-1", "Blade", "Blade-1", "Step-1", "BladeJob",
-                ]
-            }).to_excel(writer, sheet_name="Parameters", index=False)
-        template_bytes = buf_cfg.getvalue()
-
-    # Generate Abaqus script from YOUR template
-    script_text = generate_abaqus_script_from_your_template(
-        model_name=str(st.session_state.abaqus_model_name),
+    abaqus_script_text = generate_abaqus_post_import_script_refined(
         part_name=str(st.session_state.abaqus_part_name),
-        instance_name=str(st.session_state.abaqus_instance_name),
-        material_name=str(st.session_state.abaqus_material_name),
-        step_name=str(st.session_state.abaqus_step_name),
         job_name=str(st.session_state.abaqus_job_name),
-        E=float(st.session_state.abaqus_E),
+        script_model_name="Model-1",
+        instance_name="Blade-1",
+        material_name=str(st.session_state.abaqus_material_name),
+        E_MPa=float(st.session_state.abaqus_E_MPa),
         nu=float(st.session_state.abaqus_nu),
-        shell_t=float(blade_thickness_m),
-        mesh_seed=float(st.session_state.abaqus_mesh_seed),
+        shell_thickness_m=float(blade_thickness_m),
+        mesh_seed_model_units=float(st.session_state.abaqus_mesh_seed_model_units),
         load_u=float(load_u),
-        load_point_xyz=load_point_3d,
-        force_vec_xyz=force_vec,
+        load_point_m=load_point_m,
+        force_vec_N=force_vec_N,
     )
-    script_bytes = script_text.encode("utf-8")
 
-    with st.sidebar:
-        with downloads_placeholder.container():
-            with st.expander("Downloads", expanded=False):
-                st.download_button(
-                    "📥 Download CATIA design table (Excel)",
-                    data=design_table_bytes,
-                    file_name="blade_design_table.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-                st.download_button(
-                    "📥 Download config template (Excel)",
-                    data=template_bytes,
-                    file_name="config_template.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-                st.download_button(
-                    "📥 Download Abaqus Python script (.py)",
-                    data=script_bytes,
-                    file_name="abaqus_post_import_from_template.py",
-                    mime="text/x-python",
-                )
-                sampled_csv = sampled_blade_points_csv(
-                    root_c1_cubic, root_c2_cubic,
-                    tip_c1_top_2d, tip_c2_top_2d,
-                    tip_c1_bottom_2d, tip_c2_bottom_2d,
-                    blade_length_m
-                )
-                st.download_button(
-                    "Download sampled blade points (CSV)",
-                    data=sampled_csv,
-                    file_name="blade_sampled_points.csv",
-                    mime="text/csv",
-                )
+    # =========================================================
+    # Build downloads
+    # =========================================================
 
-    # ---------- Blade geometry tab ----------
-    with tab_blade:
-        st.header("Blade geometry")
+    # Design table values mapped to your attached template headers
+    values_by_header = {
+        "Config": str(st.session_state.abaqus_job_name),  # use job name as config label
+        "Num_Blades": int(num_blades),
+        "Blade_Length_m": float(blade_length_m),
+        "Blade_Thickness_m": float(blade_thickness_m),
+        "ScaleX": float(scale_x),
+        "ScaleZ": float(scale_z),
+        "Twist_Total_Deg": float(twist_total_deg),
+        "Twist_Deg_per_m": float(twist_deg_per_m),
+        "Twist_Sign": float(twist_sign),
 
-        st.subheader("Root cross-section – top surface")
-        st.plotly_chart(make_root_top_plot(root_c1_cubic, root_c2_cubic), use_container_width=True)
+        "Root_C1_P0_X": float(root_c1_cubic[0, 0]), "Root_C1_P0_Z": float(root_c1_cubic[0, 1]),
+        "Root_C1_P1_X": float(root_c1_cubic[1, 0]), "Root_C1_P1_Z": float(root_c1_cubic[1, 1]),
+        "Root_C1_P2_X": float(root_c1_cubic[2, 0]), "Root_C1_P2_Z": float(root_c1_cubic[2, 1]),
+        "Root_C1_P3_X": float(root_c1_cubic[3, 0]), "Root_C1_P3_Z": float(root_c1_cubic[3, 1]),
 
-        st.subheader("Root & tip cross-sections – top and mirrored bottom")
-        fig = make_root_and_tip_plot(
-            root_c1_cubic, root_c2_cubic,
-            tip_c1_top_2d, tip_c2_top_2d,
-            tip_c1_bottom_2d, tip_c2_bottom_2d,
-            show_root=bool(st.session_state.show_root),
-            show_tip=bool(st.session_state.show_tip),
-            x_range=x_range, z_range=z_range,
-            show_tip_c2_u_labels=True,
-            force_overlay_enabled=True,
-            force_load_xz=(float(load_point_3d[0]), float(load_point_3d[2])),
-            force_dir_xz_unit=(float(dir_xz_unit[0]), float(dir_xz_unit[1])),
-            force_arrow_len=float(arrow_len_2d),
+        "Root_C2_P0_X": float(root_c2_cubic[0, 0]), "Root_C2_P0_Z": float(root_c2_cubic[0, 1]),
+        "Root_C2_P1_X": float(root_c2_cubic[1, 0]), "Root_C2_P1_Z": float(root_c2_cubic[1, 1]),
+        "Root_C2_P2_X": float(root_c2_cubic[2, 0]), "Root_C2_P2_Z": float(root_c2_cubic[2, 1]),
+        "Root_C2_P3_X": float(root_c2_cubic[3, 0]), "Root_C2_P3_Z": float(root_c2_cubic[3, 1]),
+
+        "Tip_C1_P0_X": float(tip_c1_top_3d[0, 0]), "Tip_C1_P0_Y": float(tip_c1_top_3d[0, 1]), "Tip_C1_P0_Z": float(tip_c1_top_3d[0, 2]),
+        "Tip_C1_P1_X": float(tip_c1_top_3d[1, 0]), "Tip_C1_P1_Y": float(tip_c1_top_3d[1, 1]), "Tip_C1_P1_Z": float(tip_c1_top_3d[1, 2]),
+        "Tip_C1_P2_X": float(tip_c1_top_3d[2, 0]), "Tip_C1_P2_Y": float(tip_c1_top_3d[2, 1]), "Tip_C1_P2_Z": float(tip_c1_top_3d[2, 2]),
+        "Tip_C1_P3_X": float(tip_c1_top_3d[3, 0]), "Tip_C1_P3_Y": float(tip_c1_top_3d[3, 1]), "Tip_C1_P3_Z": float(tip_c1_top_3d[3, 2]),
+
+        "Tip_C2_P0_X": float(tip_c2_top_3d[0, 0]), "Tip_C2_P0_Y": float(tip_c2_top_3d[0, 1]), "Tip_C2_P0_Z": float(tip_c2_top_3d[0, 2]),
+        "Tip_C2_P1_X": float(tip_c2_top_3d[1, 0]), "Tip_C2_P1_Y": float(tip_c2_top_3d[1, 1]), "Tip_C2_P1_Z": float(tip_c2_top_3d[1, 2]),
+        "Tip_C2_P2_X": float(tip_c2_top_3d[2, 0]), "Tip_C2_P2_Y": float(tip_c2_top_3d[2, 1]), "Tip_C2_P2_Z": float(tip_c2_top_3d[2, 2]),
+        "Tip_C2_P3_X": float(tip_c2_top_3d[3, 0]), "Tip_C2_P3_Y": float(tip_c2_top_3d[3, 1]), "Tip_C2_P3_Z": float(tip_c2_top_3d[3, 2]),
+
+        "Hub_P0_X": float(hub_cp_xz[0, 0]), "Hub_P0_Z": float(hub_cp_xz[0, 1]),
+        "Hub_P1_X": float(hub_cp_xz[1, 0]), "Hub_P1_Z": float(hub_cp_xz[1, 1]),
+        "Hub_P2_X": float(hub_cp_xz[2, 0]), "Hub_P2_Z": float(hub_cp_xz[2, 1]),
+        "Hub_P3_X": float(hub_cp_xz[3, 0]), "Hub_P3_Z": float(hub_cp_xz[3, 1]),
+
+        "CFD_Chord": float(chord_length),
+    }
+
+    design_table_bytes = build_design_table_excel_from_template(values_by_header)
+
+    blade_cps_bytes = build_blade_control_points_excel(
+        root_c1=root_c1_cubic,
+        root_c2=root_c2_cubic,
+        tip_c1_3d=tip_c1_top_3d,
+        tip_c2_3d=tip_c2_top_3d,
+    )
+
+    config_template_bytes = build_config_template_excel()
+    abaqus_script_bytes = abaqus_script_text.encode("utf-8")
+
+    # =========================================================
+    # Main page layout
+    # =========================================================
+    st.markdown(
+    """
+    <style>
+        .block-container {
+            padding-top: 0.5rem;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+    st.markdown("## CAE4 – Blade & Hub Design Tool")
+
+
+    tab_overview, tab_blade, tab_hub = st.tabs(["Overview", "Blade geometry", "Hub geometry"])
+
+    # ---- Overview
+    with tab_overview:
+        st.header("How to use this tool")
+
+        st.markdown(
+            """
+            1) **Blade geometry inputs** (sidebar) define the root Curve 1 control points in the X–Z plane.  
+               (The tool automatically creates root Curve 2 profile).
+
+            2) Choose a **blade variant** then set ScaleX / ScaleZ / Twist to generate the tip profile.
+
+            3) In **Abaqus** (sidebar), set:
+               - Load magnitude (kN) and the u-location along Curve 2 on the Tip  
+               - Material values (E, ν)  
+               - Part name, mesh seed, job name, and script filename
+
+            4) Use **Downloads** to export:
+               - The **CATIA design table Excel**
+               - The **Abaqus .py** script
+            
+
+            """
         )
-        st.plotly_chart(fig, use_container_width=True)
 
-        st.subheader("Continuity check at Curve 1 → Curve 2 join (Root top)")
-        st.table(pd.DataFrame({"Residual": ["C0", "C1", "C2"], "Value": [c0_res, c1_res, c2_res]}))
+        if config_applied:
+            st.success("Config applied (as new defaults). You can now tweak values without them reverting.")
+        for w in config_warnings:
+            st.info(w)
 
-        st.subheader("Abaqus load values that will be injected")
-        st.table(pd.DataFrame({
-            "Name": ["LOAD_U", "LOAD_POINT (x,y,z)", "FORCE_VEC (Fx,Fy,Fz)"],
-            "Value": [load_u, str(load_point_3d), str(force_vec)]
-        }))
-
-    # ---------- 3D preview tab ----------
-    with tab_3d:
-        st.header("3D preview – Blade")
-        fig3d = make_blade_3d_plot(root_c1_cubic, root_c2_cubic, tip_c1_top_2d, tip_c2_top_2d, blade_length_m)
-        fig3d = add_force_to_3d_fig(fig3d, np.array(load_point_3d), normal_unit_3d, chord_length, label="Force direction (preview)")
-        st.plotly_chart(fig3d, use_container_width=True)
-
-    # ---------- Hub geometry tab ----------
-    with tab_hub:
-        st.header("Hub geometry")
-        st.markdown(f"Hub profile control points source: **{hub_source_label}**")
-        st.plotly_chart(make_hub_plot(hub_cp_az, hub_plane_label=hub_plane_label), use_container_width=True)
-
-    # ---------- CFD domain tab ----------
-    with tab_cfd:
-        st.header("CFD domain sizing")
-        cfd_df = pd.DataFrame(
+        st.subheader("Abaqus values")
+        # Requested removals: no target hint X/Y/Z rows and no load magnitude row
+        df_abaqus = pd.DataFrame(
             {
                 "Quantity": [
-                    "Chord length",
-                    "X-min (upstream)",
-                    "X-max (downstream)",
-                    "Y-min (radial)",
-                    "Y-max (radial)",
-                    "Z-min (vertical)",
-                    "Z-max (vertical)",
+                    "Load u on Tip Curve 2 (top)",
+                    "Unit direction X",
+                    "Unit direction Y",
+                    "Unit direction Z",
+                    "Force X (kN)",
+                    "Force Y (kN)",
+                    "Force Z (kN)",
+                    "Force magnitude (KN)",
+                    "Mesh seed",
+                    "Shell thickness (mm)",
+                    "Part name",
+                    "Job name",
+                    "Script filename",
                 ],
-                "Value [m]": [
-                    chord_length, cfd_x_min, cfd_x_max, cfd_y_min, cfd_y_max, cfd_z_min, cfd_z_max
+                "Value": [
+                    float(load_u),
+                    float(normal_unit_3d[0]),
+                    float(normal_unit_3d[1]),
+                    float(normal_unit_3d[2]),
+                    float(fxN) / 1000.0,
+                    float(fyN) / 1000.0,
+                    float(fzN) / 1000.0,
+                    float(np.sqrt(fxN * fxN + fyN * fyN + fzN * fzN)) / 1000.0,
+                    float(st.session_state.abaqus_mesh_seed_model_units),
+                    float(blade_thickness_m) * 1000.0,
+                    str(st.session_state.abaqus_part_name),
+                    str(st.session_state.abaqus_job_name),
+                    str(st.session_state.abaqus_script_filename),
                 ],
             }
         )
-        st.table(cfd_df)
+        st.table(df_abaqus)
 
-    # ---------- Abaqus config tab ----------
-    with tab_abaqus:
-        st.header("Abaqus script preview (generated from your template)")
-        st.code(script_text, language="python")
+    # ---- Blade geometry (ONLY the requested plot)
+    with tab_blade:
+        st.header("Blade geometry")
 
+        fig = make_root_and_tip_plot_only(
+            root_c1_cubic, root_c2_cubic,
+            tip_c1_top_2d, tip_c2_top_2d,
+            tip_c1_bottom_2d, tip_c2_bottom_2d,
+            x_range=x_range, z_range=z_range,
+            arrow_head_xz=(x_u, z_u),
+            arrow_dir_xz_unit=(float(dir_xz_unit[0]), float(dir_xz_unit[1])),
+            arrow_len=float(arrow_len),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ---- Hub geometry (no table)
+    with tab_hub:
+        st.header("Hub geometry")
+        st.plotly_chart(make_hub_plot(hub_cp_xz, hub_plane_label="X–Z"), use_container_width=True)
+
+    # ---- Render downloads into the sidebar Downloads expander
+    # (Streamlit doesn’t let us “inject” into that expander later, so we re-open it and render)
+    with st.sidebar:
+        with st.expander("Downloads", expanded=False):
+            st.download_button(
+                "📥 CATIA design table            ",
+                data=design_table_bytes,
+                file_name="blade_hub_design_table.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            st.download_button(
+                "📥 Control points          ",
+                data=blade_cps_bytes,
+                file_name="blade_control_points.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            st.download_button(
+                "📥 Abaqus script         ",
+                data=abaqus_script_bytes,
+                file_name=str(st.session_state.abaqus_script_filename),
+                mime="text/x-python",
+            )
+            st.download_button(
+                "📥 Config template             ",
+                data=config_template_bytes,
+                file_name=CONFIG_TEMPLATE_FILENAME,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
 if __name__ == "__main__":
     main()

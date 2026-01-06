@@ -8,6 +8,7 @@ import os
 import hashlib
 import openpyxl
 from typing import Tuple, List, Optional
+from math import comb
 
 # =========================================================
 # Files / constants
@@ -61,7 +62,7 @@ def keep_scroll_position():
 # =========================================================
 
 def binomial_coeff(n, k):
-    from math import comb
+    """Compute binomial coefficient C(n, k) using math.comb imported once at module level."""
     return comb(n, k)
 
 def general_bezier_curve(control_points, num_points=201):
@@ -1206,15 +1207,23 @@ def main():
 
     # ----------------------------
     # Sidebar (inputs)
-    #   - Downloads first
-    #   - Config uploader at bottom (under downloads)
+    # FIX: apply config BEFORE creating any widgets that use those keys
     # ----------------------------
     with st.sidebar:
         st.markdown("### Blade inputs")
 
+        # Config uploader FIRST, so apply_config_once_if_new can safely set widget-backed keys
+        with st.expander("Config", expanded=False):
+            uploaded_file = st.file_uploader(
+                "Upload Excel configuration (optional)",
+                type=["xlsx"],
+                key="excel_upload",
+            )
+            uploaded_bytes = uploaded_file.read() if uploaded_file is not None else None
 
-    
-    
+        # Apply config once per file change (now safe: runs before widgets with those keys are created)
+        config_applied, config_warnings, variant_table = apply_config_once_if_new(uploaded_bytes)
+
         with st.expander("Blade geometry inputs", expanded=False):
             st.markdown("**Root – Control Points (X–Z)**")
 
@@ -1271,10 +1280,9 @@ def main():
         with st.expander("Abaqus", expanded=False):
             st.markdown("**Applied Curve 2 Tip Load**")
 
-
             st.number_input("Load (kN)", min_value=0.0, step=0.1, format="%.3f", key="abaqus_load_mag_kN")
 
-                # Keep u away from 0/1 because PartitionEdgeByParam needs (0,1)
+            # Keep u away from 0/1 because PartitionEdgeByParam needs (0,1)
             st.slider("Load location U (0–1)", min_value=0.01, max_value=0.99, step=0.01, key="abaqus_u")
 
             st.markdown("---")
@@ -1297,20 +1305,6 @@ def main():
             )
             st.text_input("Job name", key="abaqus_job_name")
             st.text_input("Abaqus script filename", key="abaqus_script_filename")
-
-        # Config uploader at bottom (under downloads)
-        with st.expander("Config", expanded=False):
-            uploaded_file = st.file_uploader(
-                "Upload Excel configuration (optional)",
-                type=["xlsx"],
-                key="excel_upload",
-            )
-            uploaded_bytes = uploaded_file.read() if uploaded_file is not None else None
-
-    # Apply config once per file change
-    config_applied, config_warnings, variant_table = apply_config_once_if_new(
-        uploaded_bytes if "uploaded_bytes" in locals() else None
-    )
 
     # =========================================================
     # Compute geometry from session_state
@@ -1498,18 +1492,17 @@ def main():
     # Main page layout
     # =========================================================
     st.markdown(
-    """
-    <style>
-        .block-container {
-            padding-top: 0.5rem;
-        }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+        """
+        <style>
+            .block-container {
+                padding-top: 0.5rem;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
     st.markdown("## CAE4 – Blade & Hub Design Tool")
-
 
     tab_overview, tab_blade, tab_hub = st.tabs(["Overview", "Blade geometry", "Hub geometry"])
 
@@ -1532,8 +1525,6 @@ def main():
             4) Use **Downloads** to export:
                - The **CATIA design table Excel**
                - The **Abaqus .py** script
-            
-
             """
         )
 
@@ -1543,7 +1534,6 @@ def main():
             st.info(w)
 
         st.subheader("Abaqus values")
-        # Requested removals: no target hint X/Y/Z rows and no load magnitude row
         df_abaqus = pd.DataFrame(
             {
                 "Quantity": [
@@ -1601,7 +1591,6 @@ def main():
         st.plotly_chart(make_hub_plot(hub_cp_xz, hub_plane_label="X–Z"), use_container_width=True)
 
     # ---- Render downloads into the sidebar Downloads expander
-    # (Streamlit doesn’t let us “inject” into that expander later, so we re-open it and render)
     with st.sidebar:
         with st.expander("Downloads", expanded=False):
             st.download_button(

@@ -142,11 +142,7 @@ def transform_tip_from_root(cp_root, scale_x, scale_z, twist_deg_per_m, blade_le
 
 def default_variant_table() -> pd.DataFrame:
     return pd.DataFrame(
-        {
-            "NumBlades": [3, 4, 5],
-            "BladeLength_m": [50.0, 40.0, 30.0],
-            "Thickness_m": [0.018, 0.015, 0.010],
-        }
+        {"NumBlades": [3, 4, 5], "BladeLength_m": [50.0, 40.0, 30.0], "Thickness_m": [0.018, 0.015, 0.010]}
     )
 
 def parse_variant_table_from_excel(xls: pd.ExcelFile) -> Optional[pd.DataFrame]:
@@ -315,7 +311,6 @@ def ensure_state_defaults():
     st.session_state.hub_p3_x = 2.0
     st.session_state.hub_p3_z = 0.0
 
-    # Abaqus defaults (UI units)
     st.session_state.abaqus_load_mag_kN = 1.0
     st.session_state.abaqus_u = 0.50
     st.session_state.abaqus_part_name = "Blade"
@@ -328,17 +323,11 @@ def ensure_state_defaults():
     st.session_state.abaqus_mesh_seed_model_units = 250.0
 
     st.session_state.last_config_hash = None
-
-    # Config results kept in state
     st.session_state.config_applied = False
     st.session_state.config_warnings = []
     st.session_state.variant_table = default_variant_table()
 
 def apply_config_once_if_new(uploaded_bytes: bytes) -> Tuple[bool, List[str], pd.DataFrame]:
-    """
-    Must be called from file_uploader callback to avoid mutating widget-backed keys
-    after the widgets already exist.
-    """
     warnings = []
     applied = False
     variant_table = default_variant_table()
@@ -399,7 +388,6 @@ def apply_config_once_if_new(uploaded_bytes: bytes) -> Tuple[bool, List[str], pd
             except Exception:
                 warnings.append("Parameter 'TwistSign' invalid; ignored.")
 
-        # Abaqus: IMPORTANT: includes AbaqusU -> sets abaqus_u
         if "AbaqusLoadMag_kN" in params:
             try_set_float("abaqus_load_mag_kN", "AbaqusLoadMag_kN")
         elif "AbaqusLoadMag" in params:
@@ -591,7 +579,16 @@ def make_hub_plot(hub_cp_xz, hub_plane_label="X–Z"):
 
 # =========================================================
 # Abaqus script generator
-#   IMPORTANT: LOAD_U and LOAD_POINT are embedded from the CURRENT Streamlit slider value.
+#
+# FIXES INCLUDED:
+#  1) U inversion: Abaqus edge parameterization is opposite to UI Bezier u.
+#     -> We keep UI_U as-is, but we partition using EDGE_U = 1 - UI_U.
+#     -> Script prints both so it's obvious.
+#
+#  2) Load at origin: instead of relying only on LOAD_POINT to find a node,
+#     we explicitly locate the NEW VERTEX created by PartitionEdgeByParam,
+#     then pick the closest node to that vertex. This anchors the load to the
+#     partition location (i.e., to the u-defined position on the tip edge).
 # =========================================================
 
 def generate_abaqus_post_import_script_refined(
@@ -604,7 +601,8 @@ def generate_abaqus_post_import_script_refined(
     nu: float,
     shell_thickness_m: float,
     mesh_seed_model_units: float,
-    load_u: float,
+    load_u_ui: float,  # UI u (what you set in Streamlit)
+    load_u_edge: float,  # edge u (what PartitionEdgeByParam should use)
     load_point_m: Tuple[float, float, float],
     force_vec_N: Tuple[float, float, float],
 ):
@@ -615,9 +613,7 @@ def generate_abaqus_post_import_script_refined(
     STEP_NAME = "Step-1"
     E_Pa = float(E_MPa) * 1e6
 
-    # NOTE: This script will partition at LOAD_U and then apply the force at the closest
-    # node to LOAD_POINT (which is computed from the SAME u in the Streamlit app).
-    return f"""#Code: V1.5.4
+    return f"""#Code: V1.6.0
 
 from abaqus import mdb
 from abaqusConstants import *
@@ -639,11 +635,15 @@ SHELL_T = {float(shell_thickness_m):.16g}
 
 MESH_SEED = {float(mesh_seed_model_units):.16g}
 
-# --- USER-DEFINED LOCATION ALONG THE TIP EDGE (0..1)
-LOAD_U = {float(load_u):.16g}
+# Streamlit UI u (for reporting / traceability)
+UI_U   = {float(load_u_ui):.16g}
 
-# --- LOAD POINT GENERATED FROM THE SAME u VALUE IN THE STREAMLIT APP
+# Edge-parameter u used by Abaqus PartitionEdgeByParam (inverted vs UI)
+EDGE_U = {float(load_u_edge):.16g}
+
+# LOAD_POINT from Streamlit (computed on tip Curve2 top using UI_U)
 LOAD_POINT = ({float(load_point_m[0]):.16g}, {float(load_point_m[1]):.16g}, {float(load_point_m[2]):.16g})
+
 FORCE_VEC  = ({float(force_vec_N[0]):.16g}, {float(force_vec_N[1]):.16g}, {float(force_vec_N[2]):.16g})
 
 AUTO_UNIT_SCALE = True
@@ -719,7 +719,6 @@ def detect_unit_scale_from_geometry(part_obj, load_point):
         return 1.0, root_y, tip_y, low, high
 
     ratio = abs(tip_y / lp_y)
-
     if 200.0 < ratio < 5000.0:
         scale = ratio
         log("AUTO_UNIT_SCALE: Detected geometry/load mismatch.")
@@ -801,6 +800,7 @@ def find_tip_top_edge_near_loadpoint(inst, tip_y, tol_y, load_point):
         p = edge_avg_point(e)
         if p[2] >= 0.0:
             top_edges.append(e)
+
     log("Top tip edges (z>=0) candidates: %d" % len(top_edges))
     if len(top_edges) == 0:
         die("Found tip-plane edges, but none qualify as TOP (z>=0). Check coordinate system / sign convention.")
@@ -816,15 +816,22 @@ def find_tip_top_edge_near_loadpoint(inst, tip_y, tol_y, load_point):
             best_d = d
             best_p = p
 
-    if best is None:
-        die("Failed to pick a best tip top edge (unexpected).")
-
     log("Selected tip-top edge: index=%s, avgPt=(%.6g, %.6g, %.6g), dist_to_LOAD_POINT≈%.6g"
         % (str(best.index), best_p[0], best_p[1], best_p[2], best_d))
     return best
 
-def partition_edge_by_u(part_obj, inst_edge, u_param):
-    log("Partitioning selected tip edge at u=%.6f ..." % float(u_param))
+def get_vertex_points(part_obj):
+    pts = []
+    for v in part_obj.vertices:
+        p = v.pointOn[0]
+        pts.append((float(p[0]), float(p[1]), float(p[2])))
+    return pts
+
+def partition_edge_by_param_and_get_new_vertex(part_obj, inst_edge, u_param, load_point_scaled, tip_y, tol_y):
+    log("Partitioning selected tip edge at EDGE_U=%.6f ..." % float(u_param))
+
+    before_pts = get_vertex_points(part_obj)
+
     try:
         part_edge = part_obj.edges[inst_edge.index]
     except Exception as ex:
@@ -833,9 +840,50 @@ def partition_edge_by_u(part_obj, inst_edge, u_param):
     try:
         part_obj.PartitionEdgeByParam(edges=(part_edge,), parameter=float(u_param))
     except Exception as ex:
-        die("PartitionEdgeByParam failed. (u=%.6f) Error: %s" % (float(u_param), ex))
+        die("PartitionEdgeByParam failed. (EDGE_U=%.6f) Error: %s" % (float(u_param), ex))
 
-    log("PartitionEdgeByParam succeeded at u=%.6f" % float(u_param))
+    after_pts = get_vertex_points(part_obj)
+
+    # Identify new vertex candidates (points not present before) by proximity
+    new_pts = []
+    for p in after_pts:
+        is_new = True
+        for q in before_pts:
+            if (abs(p[0]-q[0]) < 1e-9) and (abs(p[1]-q[1]) < 1e-9) and (abs(p[2]-q[2]) < 1e-9):
+                is_new = False
+                break
+        if is_new:
+            new_pts.append(p)
+
+    log("Partition created %d new vertex candidates." % len(new_pts))
+    if len(new_pts) == 0:
+        # Fallback: even if no new vertices detected (rare), still proceed using LOAD_POINT
+        log("WARNING: Could not detect a new vertex; will fall back to LOAD_POINT for node selection.")
+        return None
+
+    # Prefer a new vertex on the TIP plane (y≈tip_y) and TOP side (z>=0), closest to LOAD_POINT
+    best = None
+    best_d = None
+    for p in new_pts:
+        if abs(p[1] - tip_y) > 5.0 * tol_y:
+            continue
+        if p[2] < -1e-12:
+            continue
+        d = dist3(p, load_point_scaled)
+        if best is None or d < best_d:
+            best = p
+            best_d = d
+
+    if best is None:
+        # Secondary fallback: closest new vertex to LOAD_POINT
+        for p in new_pts:
+            d = dist3(p, load_point_scaled)
+            if best is None or d < best_d:
+                best = p
+                best_d = d
+
+    log("Chosen partition vertex (target): (%.6g, %.6g, %.6g), dist_to_LOAD_POINT≈%.6g" % (best[0], best[1], best[2], best_d))
+    return best
 
 def apply_root_pinned_bc(model, inst, root_y, tol_y):
     log("Applying pinned BC at root (y≈%.6g, tol=%.6g)..." % (root_y, tol_y))
@@ -903,18 +951,18 @@ def closest_node(nodes_obj, xyz):
             return first
     return None
 
-def apply_concentrated_force_at_loadpoint(model, inst, load_point, force_vec):
-    log("Applying concentrated force at closest node to LOAD_POINT...")
+def apply_concentrated_force_at_xyz(model, inst, xyz, force_vec):
+    log("Applying concentrated force at closest node to TARGET_XYZ...")
 
     nodes = inst.nodes
     if len(nodes) == 0:
         die("No mesh nodes on instance. Meshing failed or not generated.")
 
-    node_obj = closest_node(nodes, load_point)
+    node_obj = closest_node(nodes, xyz)
     if node_obj is None:
-        die("Could not find closest node to LOAD_POINT=%s. Check mesh and coordinates." % str(load_point))
+        die("Could not find closest node to TARGET_XYZ=%s. Check mesh and coordinates." % str(xyz))
 
-    log("Closest node label=%d (target LOAD_POINT=%s)" % (int(node_obj.label), str(load_point)))
+    log("Closest node label=%d (TARGET_XYZ=%s)" % (int(node_obj.label), str(xyz)))
 
     a = model.rootAssembly
     set_name = "SET_LOAD_NODE"
@@ -965,8 +1013,9 @@ def make_job_and_run():
 
 def main():
     log("===== START POST-IMPORT BLADE SCRIPT =====")
-    log("USING LOAD_U=%.6f" % float(LOAD_U))
-    log("USING LOAD_POINT=%s" % str(LOAD_POINT))
+    log("UI_U=%.6f   (Streamlit)" % float(UI_U))
+    log("EDGE_U=%.6f (used for PartitionEdgeByParam; inverted vs UI_U)" % float(EDGE_U))
+    log("LOAD_POINT (Streamlit curve point)=%s" % str(LOAD_POINT))
 
     model = get_model()
     part_obj = get_part(model)
@@ -979,30 +1028,48 @@ def main():
 
     shell_t_scaled = float(SHELL_T) * float(UNIT_SCALE)
     mesh_seed_scaled = float(MESH_SEED)
+
     load_point_scaled = (float(LOAD_POINT[0]) * float(UNIT_SCALE),
                          float(LOAD_POINT[1]) * float(UNIT_SCALE),
                          float(LOAD_POINT[2]) * float(UNIT_SCALE))
 
+    log("UNIT_SCALE=%.6g" % float(UNIT_SCALE))
+    log("Scaled LOAD_POINT=%s" % str(load_point_scaled))
+
     span = float(tip_y_raw - root_y_raw)
     tol_y = max(1e-6, 1e-4 * abs(span) if abs(span) > 0 else 1e-6)
+    log("root_y=%.6g tip_y=%.6g span=%.6g tol_y=%.6g" % (root_y_raw, tip_y_raw, span, tol_y))
 
     ensure_material_and_section(model, part_obj, shell_t_scaled)
     ensure_step(model)
 
+    # Find the correct TIP top edge (closest to the streamlit load point)
     curve2_tip_edge = find_tip_top_edge_near_loadpoint(inst, tip_y_raw, tol_y, load_point_scaled)
 
-    # --- THIS IS THE CRITICAL BIT: partition at the embedded LOAD_U (from Streamlit slider)
-    partition_edge_by_u(part_obj, curve2_tip_edge, LOAD_U)
+    # Partition at EDGE_U (inverted relative to UI_U)
+    target_vertex = partition_edge_by_param_and_get_new_vertex(
+        part_obj=part_obj,
+        inst_edge=curve2_tip_edge,
+        u_param=EDGE_U,
+        load_point_scaled=load_point_scaled,
+        tip_y=tip_y_raw,
+        tol_y=tol_y
+    )
 
     model.rootAssembly.regenerate()
 
+    # Mesh after partition
     mesh_part(part_obj, mesh_seed_scaled)
     model.rootAssembly.regenerate()
 
+    # Root BC
     apply_root_pinned_bc(model, inst, root_y_raw, tol_y)
 
-    # --- Apply load at closest node to the embedded LOAD_POINT (also from same u)
-    apply_concentrated_force_at_loadpoint(model, inst, load_point_scaled, FORCE_VEC)
+    # Apply load at the partition vertex location (robust) else fallback to LOAD_POINT
+    if target_vertex is not None:
+        apply_concentrated_force_at_xyz(model, inst, target_vertex, FORCE_VEC)
+    else:
+        apply_concentrated_force_at_xyz(model, inst, load_point_scaled, FORCE_VEC)
 
     make_job_and_run()
     log("===== END POST-IMPORT BLADE SCRIPT =====")
@@ -1046,17 +1113,13 @@ def build_blade_control_points_excel(
     rows_root = []
     for curve_name, cp in [("Root Curve 1", root_c1), ("Root Curve 2", root_c2)]:
         for i in range(cp.shape[0]):
-            rows_root.append(
-                {"Curve": curve_name, "PointIndex": i, "X": float(cp[i, 0]), "Y": 0.0, "Z": float(cp[i, 1])}
-            )
+            rows_root.append({"Curve": curve_name, "PointIndex": i, "X": float(cp[i, 0]), "Y": 0.0, "Z": float(cp[i, 1])})
     df_root = pd.DataFrame(rows_root)
 
     rows_tip = []
     for curve_name, cp in [("Tip Curve 1", tip_c1_3d), ("Tip Curve 2", tip_c2_3d)]:
         for i in range(cp.shape[0]):
-            rows_tip.append(
-                {"Curve": curve_name, "PointIndex": i, "X": float(cp[i, 0]), "Y": float(cp[i, 1]), "Z": float(cp[i, 2])}
-            )
+            rows_tip.append({"Curve": curve_name, "PointIndex": i, "X": float(cp[i, 0]), "Y": float(cp[i, 1]), "Z": float(cp[i, 2])})
     df_tip = pd.DataFrame(rows_tip)
 
     buf = BytesIO()
@@ -1102,7 +1165,6 @@ def build_config_template_excel() -> bytes:
 def on_config_upload_change():
     uploaded_file = st.session_state.get("excel_upload", None)
     uploaded_bytes = uploaded_file.read() if uploaded_file is not None else None
-
     applied, warnings, variant_table = apply_config_once_if_new(uploaded_bytes)
     st.session_state.config_applied = bool(applied)
     st.session_state.config_warnings = list(warnings)
@@ -1113,9 +1175,6 @@ def main():
     keep_scroll_position()
     ensure_state_defaults()
 
-    # ----------------------------
-    # Sidebar (inputs)
-    # ----------------------------
     with st.sidebar:
         st.markdown("### Blade inputs")
 
@@ -1195,7 +1254,6 @@ def main():
                 on_change=on_config_upload_change,
             )
 
-    # Config results from state
     config_applied = bool(st.session_state.get("config_applied", False))
     config_warnings = list(st.session_state.get("config_warnings", []))
     variant_table = st.session_state.get("variant_table", default_variant_table())
@@ -1273,13 +1331,19 @@ def main():
     chord_length = float(np.max(x_all_root) - 0.0) if x_all_root.size else 1.0
 
     # =========================================================
-    # Abaqus load intent (THIS is what drives the downloaded script)
+    # Abaqus load intent (UI)
     # =========================================================
-    load_u = float(st.session_state.abaqus_u)           # <-- user slider value
+    load_u_ui = float(st.session_state.abaqus_u)
+
+    # Abaqus edge parameterization is reversed w.r.t. our UI Bezier u:
+    # If UI says 0.8, Abaqus partition needs 0.2 to hit the same physical point on the edge.
+    load_u_edge = float(1.0 - load_u_ui)
+
     load_mag_kN = float(st.session_state.abaqus_load_mag_kN)
     load_mag_N = load_mag_kN * 1000.0
 
-    pt2d, tan2d = bezier_point_and_tangent(tip_c2_top_2d, load_u)
+    # Streamlit curve point stays based on UI u (physical point the user intends)
+    pt2d, tan2d = bezier_point_and_tangent(tip_c2_top_2d, load_u_ui)
     x_u, z_u = float(pt2d[0]), float(pt2d[1])
     dxdu, dzdu = float(tan2d[0]), float(tan2d[1])
 
@@ -1288,6 +1352,7 @@ def main():
     nmag = float(np.linalg.norm(normal_3d))
     normal_unit_3d = (normal_3d / nmag) if nmag > 0 else np.array([0.0, 0.0, -1.0])
 
+    # Force must go "into the blade" on the TOP curve -> enforce negative Z direction
     if float(normal_unit_3d[2]) > 0.0:
         normal_unit_3d = -normal_unit_3d
 
@@ -1301,7 +1366,7 @@ def main():
 
     arrow_len = 0.12 * chord_length if chord_length > 0 else 0.12
 
-    load_point_m = (x_u, float(blade_length_m), z_u)    # <-- same u
+    load_point_m = (x_u, float(blade_length_m), z_u)
     force_vec_N = (float(fxN), float(fyN), float(fzN))
 
     abaqus_script_text = generate_abaqus_post_import_script_refined(
@@ -1314,8 +1379,9 @@ def main():
         nu=float(st.session_state.abaqus_nu),
         shell_thickness_m=float(blade_thickness_m),
         mesh_seed_model_units=float(st.session_state.abaqus_mesh_seed_model_units),
-        load_u=float(load_u),                 # <-- embeds current slider u
-        load_point_m=load_point_m,            # <-- embeds point from same u
+        load_u_ui=float(load_u_ui),
+        load_u_edge=float(load_u_edge),
+        load_point_m=load_point_m,
         force_vec_N=force_vec_N,
     )
 
@@ -1371,10 +1437,8 @@ def main():
     config_template_bytes = build_config_template_excel()
     abaqus_script_bytes = abaqus_script_text.encode("utf-8")
 
-    # --- IMPORTANT practical fix for “it always looks like 0.5”:
-    # Many browsers reuse the previously downloaded filename in the Downloads folder.
-    # So we include the current u in the downloaded filename to make it obvious it changed.
-    u_tag = f"{load_u:.2f}".replace(".", "p")
+    # Make it obvious which u was used in a downloaded file
+    u_tag = f"{load_u_ui:.2f}".replace(".", "p")
     base_name = str(st.session_state.abaqus_script_filename).strip()
     if base_name.lower().endswith(".py"):
         base_root = base_name[:-3]
@@ -1382,9 +1446,6 @@ def main():
         base_root = base_name
     abaqus_download_name = f"{base_root}_u{u_tag}.py"
 
-    # =========================================================
-    # Main page layout
-    # =========================================================
     st.markdown(
         """
         <style>
@@ -1427,7 +1488,8 @@ def main():
         df_abaqus = pd.DataFrame(
             {
                 "Quantity": [
-                    "Load u on Tip Curve 2 (top)",
+                    "UI u on Tip Curve 2 (top)",
+                    "Abaqus EDGE_U used for PartitionEdgeByParam",
                     "Unit direction X",
                     "Unit direction Y",
                     "Unit direction Z",
@@ -1442,7 +1504,8 @@ def main():
                     "Script filename (download)",
                 ],
                 "Value": [
-                    float(load_u),
+                    float(load_u_ui),
+                    float(load_u_edge),
                     float(normal_unit_3d[0]),
                     float(normal_unit_3d[1]),
                     float(normal_unit_3d[2]),
@@ -1491,7 +1554,6 @@ def main():
                 file_name="blade_control_points.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-            # Key includes u so Streamlit always treats it as a new download target
             st.download_button(
                 "📥 Abaqus script",
                 data=abaqus_script_bytes,
